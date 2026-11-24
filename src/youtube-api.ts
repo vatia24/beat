@@ -6,6 +6,8 @@ export interface YouTubePlayer {
   loadVideoById(options: { videoId: string; startSeconds: number }): void;
   seekTo(seconds: number, allowSeekAhead: boolean): void;
   getCurrentTime(): number;
+  getDuration(): number;
+  getPlaybackRate(): number;
   getPlayerState(): number;
   destroy(): void;
 }

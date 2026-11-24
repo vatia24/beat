@@ -430,6 +430,29 @@ input::placeholder {
   flex-wrap: wrap;
   margin-top: 14px;
 }
+.source-choice {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  margin-bottom: 16px;
+  background: #eff1eb;
+  border-radius: 10px;
+}
+.source-choice button {
+  padding: 9px 15px;
+  font: inherit;
+  color: #41483e;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.source-choice button[aria-pressed="true"] {
+  color: #fff;
+  background: #283628;
+}
+.track-form .status-note { margin: 0 0 8px; }
+.track-form input[type="file"] { width: 100%; min-width: 0; font-size: .85rem; }
 .status-note {
   line-height: 1.65;
 }

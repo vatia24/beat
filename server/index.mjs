@@ -5,10 +5,12 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
+import { AudioRequestError, createAudioStore } from './audio-store.mjs';
 
 const defaultDist = fileURLToPath(new URL('../dist/', import.meta.url));
 const roomRoute = /^\/r\/[a-f0-9]{12}\/?$/;
 const videoIdPattern = /^[A-Za-z0-9_-]{11}$/;
+const audioRoute = /^\/api\/rooms\/([a-f0-9]{12})\/audio(?:\/([a-f0-9]{32}))?$/;
 const contentTypes = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -44,6 +46,27 @@ function originAllowed(request, publicOrigin) {
   } catch {
     return false;
   }
+}
+
+function allowApi(request, response, origin, methods, headers) {
+  response.setHeader('Vary', 'Origin');
+  if (!originAllowed(request, origin)) {
+    respond(response, 403, { error: 'origin_denied' });
+    return false;
+  }
+  if (origin && request.headers.origin === origin) response.setHeader('Access-Control-Allow-Origin', origin);
+  if (request.method === 'OPTIONS') {
+    response.setHeader('Access-Control-Allow-Methods', methods.join(', '));
+    response.setHeader('Access-Control-Allow-Headers', headers);
+    response.writeHead(204);
+    response.end();
+    return false;
+  }
+  if (!methods.includes(request.method)) {
+    respond(response, 405, { error: 'method_not_allowed' });
+    return false;
+  }
+  return true;
 }
 
 async function sendFile(request, response, pathname, dist) {
@@ -90,54 +113,96 @@ export function createBeatroomServer({
   emptyRoomTtlMs = 6 * 60 * 60 * 1000,
   distDirectory = defaultDist,
   publicOrigin = process.env.PUBLIC_ORIGIN,
+  audioBudgetBytes,
 } = {}) {
   const rooms = new Map();
+  const audioStore = createAudioStore(audioBudgetBytes);
   const dist = path.resolve(distDirectory);
   const origin = publicOrigin ? new URL(publicOrigin).origin : null;
   const wss = new WebSocketServer({ noServer: true, maxPayload: 8192, perMessageDeflate: false });
 
+  function releaseAudio(room) {
+    room.audio?.release();
+    room.audio = null;
+    room.readyMembers.clear();
+  }
+
+  function readiness(room) {
+    return { type: 'readiness', fileId: room.state.file.id, ready: room.readyMembers.size };
+  }
+
   function prune() {
     const cutoff = now() - emptyRoomTtlMs;
     for (const [id, room] of rooms) {
-      if (!room.members.size && room.emptySince <= cutoff) rooms.delete(id);
+      if (!room.members.size && room.emptySince <= cutoff) {
+        releaseAudio(room);
+        rooms.delete(id);
+      }
     }
   }
 
   const server = createServer(async (request, response) => {
     setHeaders(response);
     try {
-      const { pathname } = new URL(request.url ?? '/', 'http://localhost');
+      const { pathname, searchParams } = new URL(request.url ?? '/', 'http://localhost');
       if (pathname === '/healthz' && (request.method === 'GET' || request.method === 'HEAD')) {
         return respond(response, 200, { ok: true });
       }
       if (pathname === '/api/rooms' && (request.method === 'POST' || request.method === 'OPTIONS')) {
-        response.setHeader('Vary', 'Origin');
-        if (!originAllowed(request, origin)) return respond(response, 403, { error: 'origin_denied' });
-        // Direct browser requests from a separately deployed UI need CORS.
-        // Same-origin installations still work with PUBLIC_ORIGIN unset.
-        if (origin && request.headers.origin === origin) {
-          response.setHeader('Access-Control-Allow-Origin', origin);
-        }
-        if (request.method === 'OPTIONS') {
-          response.setHeader('Access-Control-Allow-Methods', 'POST');
-          response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-          response.writeHead(204);
-          return response.end();
-        }
+        if (!allowApi(request, response, origin, ['POST'], 'Content-Type')) return;
         if (rooms.size >= 4096) prune();
         if (rooms.size >= 4096) return respond(response, 503, { error: 'server_busy' });
         let id;
         do { id = randomBytes(6).toString('hex'); } while (rooms.has(id));
         const hostToken = randomBytes(32).toString('base64url');
         const created = now();
-        const state = { id, version: 0, videoId: null, playing: false, anchorServerMs: created, anchorMediaSec: 0 };
-        rooms.set(id, { state, hostToken, members: new Set(), seen: new Set(), emptySince: created });
+        const state = { id, version: 0, videoId: null, file: null, playing: false, anchorServerMs: created, anchorMediaSec: 0 };
+        rooms.set(id, { state, hostToken, members: new Set(), readyMembers: new Set(), audio: null, seen: new Set(), emptySince: created });
         return respond(response, 201, { roomId: id, hostToken });
+      }
+      const audioMatch = pathname.match(audioRoute);
+      if (audioMatch) {
+        const [, roomId, fileId] = audioMatch;
+        if (!allowApi(request, response, origin, fileId ? ['GET', 'HEAD'] : ['PUT'], 'Content-Type, Authorization')) return;
+        const room = rooms.get(roomId);
+        if (!room) return respond(response, 404, { error: 'room_not_found' });
+        if (fileId) {
+          if (room.state.file?.id !== fileId) return respond(response, 404, { error: 'file_not_found' });
+          return room.audio.serve(request, response);
+        }
+        const bearer = /^Bearer ([A-Za-z0-9_-]+)$/i.exec(request.headers.authorization ?? '');
+        if (!hostMatches(room.hostToken, bearer?.[1])) return respond(response, 403, { error: 'forbidden' });
+        const rawVersion = searchParams.get('version');
+        if (!rawVersion || !/^(0|[1-9]\d*)$/.test(rawVersion) || !Number.isSafeInteger(Number(rawVersion))) {
+          return respond(response, 400, { error: 'invalid_version' });
+        }
+        const version = Number(rawVersion);
+        if (room.state.version !== version) return respond(response, 409, { error: 'stale_version', room: room.state });
+        const name = (searchParams.get('name') ?? '').split(/[\\/]/).pop().replace(/[\x00-\x1F\x7F]/g, '').trim().slice(0, 128) || 'Audio';
+        const asset = await audioStore.receive(request);
+        // Commands, a competing PUT or room expiry may have intervened while reading.
+        if (rooms.get(roomId) !== room || room.state.version !== version) {
+          asset.release();
+          return rooms.has(roomId) ? respond(response, 409, { error: 'stale_version', room: room.state }) :
+            respond(response, 404, { error: 'room_not_found' });
+        }
+        releaseAudio(room);
+        const file = { id: randomBytes(16).toString('hex'), name, size: asset.size, mime: asset.mime };
+        room.audio = asset;
+        room.state = { ...room.state, version: version + 1, videoId: null, file, playing: false, anchorServerMs: now(), anchorMediaSec: 0 };
+        broadcast(room, { type: 'state', room: room.state });
+        broadcast(room, readiness(room));
+        return respond(response, 200, { room: room.state });
       }
       if (request.method !== 'GET' && request.method !== 'HEAD') return respond(response, 405, { error: 'method_not_allowed' });
       await sendFile(request, response, pathname, dist);
     } catch (err) {
+      if (response.destroyed) return;
       if (response.headersSent) return response.destroy();
+      if (err instanceof AudioRequestError) {
+        if (!request.complete) response.setHeader('Connection', 'close');
+        return respond(response, err.status, { error: err.message });
+      }
       const status = err instanceof URIError || err instanceof TypeError ? 400 :
         ['ENOENT', 'ENOTDIR'].includes(err.code) ? 404 : 500;
       respond(response, status, { error: status === 404 ? 'not_found' : 'request_failed' });
@@ -185,7 +250,17 @@ export function createBeatroomServer({
         clearTimeout(joinTimeout);
         room.members.add(socket);
         send(socket, { type: 'welcome', room: room.state, role, participants: room.members.size });
+        if (room.state.file) send(socket, readiness(room));
         if (isNew) broadcast(room, { type: 'presence', participants: room.members.size }, socket);
+        return;
+      }
+      if (msg.type === 'fileReady') {
+        if (!room?.state.file || msg.fileId !== room.state.file.id || typeof msg.ready !== 'boolean') return;
+        if (room.readyMembers.has(socket) !== msg.ready) {
+          if (msg.ready) room.readyMembers.add(socket);
+          else room.readyMembers.delete(socket);
+          broadcast(room, readiness(room));
+        }
         return;
       }
       if (msg.type !== 'command') return fail('invalid_message', 'უცნობი შეტყობინებაა.');
@@ -202,9 +277,12 @@ export function createBeatroomServer({
         if (typeof videoId !== 'string' || !videoIdPattern.test(videoId)) {
           return fail('invalid_video', 'ვიდეოს იდენტიფიკატორი არასწორია.', requestId);
         }
-        room.state = { ...state, videoId, playing: false, anchorMediaSec: 0, anchorServerMs: received };
+        releaseAudio(room);
+        room.state = { ...state, videoId, file: null, playing: false, anchorMediaSec: 0, anchorServerMs: received };
+      } else if (action === 'end' && state.file && state.playing) {
+        room.state = { ...state, playing: false, anchorMediaSec: 0, anchorServerMs: received };
       } else if (action === 'play' || action === 'pause') {
-        if (!state.videoId) return fail('no_track', 'ჯერ აირჩიე ვიდეო.', requestId);
+        if (!state.videoId && !state.file) return fail('no_track', 'ჯერ აირჩიე ტრეკი.', requestId);
         const playing = action === 'play';
         if (state.playing === playing) return fail('no_change', 'ოთახი უკვე ამ მდგომარეობაშია.', requestId, true);
         const elapsed = state.playing ? Math.max(0, received - state.anchorServerMs) / 1000 : 0;
@@ -225,6 +303,7 @@ export function createBeatroomServer({
       room.members.delete(socket);
       if (!room.members.size) room.emptySince = now();
       broadcast(room, { type: 'presence', participants: room.members.size });
+      if (room.readyMembers.delete(socket) && room.state.file) broadcast(room, readiness(room));
     });
   });
 
@@ -241,6 +320,8 @@ export function createBeatroomServer({
 
   function close() {
     clearInterval(sweep);
+    for (const room of rooms.values()) releaseAudio(room);
+    rooms.clear();
     for (const ws of wss.clients) ws.terminate();
     wss.close();
     const done = new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));

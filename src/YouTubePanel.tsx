@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RoomSnapshot } from "./protocol";
 import { loadYouTubeApi, type YouTubePlayer } from "./youtube-api";
+import { YouTubeResync } from "./youtube-resync";
 
 export interface YouTubeTelemetry {
   position: number | null;
@@ -51,11 +52,44 @@ function ActivePlayer(props: PanelProps & {
   const held = useRef(false);
   const awaitingNativePlay = useRef(false);
   const pending = useRef<number | undefined>(undefined);
+  const manual = useRef<YouTubeResync | null>(null);
+  const [checking, setChecking] = useState(false);
   const [notice, setNotice] = useState("YouTube პლეერი იტვირთება.");
   const [fault, setFault] = useState("");
   const [generation, setGeneration] = useState(0);
   const [isReady, setIsReady] = useState(false);
   const cancel = useCallback(() => window.clearTimeout(pending.current), []);
+  const finishManual = useCallback((message?: string) => {
+    if (!manual.current) return;
+    manual.current = null;
+    setChecking(false);
+    if (message) setNotice(message);
+  }, []);
+
+  const tickManual = useCallback(() => {
+    const run = manual.current;
+    const p = player.current;
+    if (!run || !p) return;
+    const { room, connected, serverNow } = latest.current;
+    const now = serverNow();
+    if (!connected || !room.playing || room.version !== run.roomVersion || now === null ||
+        !sufficientlyVisible(stage.current) || held.current || awaitingNativePlay.current) {
+      finishManual("ადგილობრივი კორექცია შეწყდა. დასაბრუნებლად გამოაჩინე ვიდეო და ხელახლა სცადე.");
+      return;
+    }
+    const state = p.getPlayerState();
+    if ((state !== 1 && state !== 3) || p.getPlaybackRate() !== 1) {
+      finishManual("სინქრონიზაციისთვის ჩართე ძირითადი სიმღერა ჩვეულებრივ სიჩქარეზე (1×) და ხელახლა სცადე.");
+      return;
+    }
+    const target = room.anchorMediaSec + (now - room.anchorServerMs) / 1000;
+    const result = run.sample(performance.now(), target, p.getCurrentTime(), state === 1, p.getDuration());
+    if (result.kind === "finish") finishManual(result.message);
+    if (result.kind === "seek") {
+      setNotice("ამ ტელეფონზე გადახვევა მოთხოვნილია. პლეერის პასუხი მოწმდება…");
+      p.seekTo(result.position, true);
+    }
+  }, [finishManual]);
 
   const report = useCallback((state: string) => {
     lastState.current = state;
@@ -68,7 +102,7 @@ function ActivePlayer(props: PanelProps & {
 
   // Apply a room revision only once. The clock is sampled again at the deadline
   // because both the offset estimate and browser timer delivery can change.
-  const reconcile = useCallback(function apply(localAction: "join" | "resync" | null = null) {
+  const reconcile = useCallback(function apply(localAction: "join" | null = null) {
     cancel();
     const { room, connected, optedIn, role, videoId, serverNow } = latest.current;
     const p = player.current;
@@ -116,7 +150,7 @@ function ActivePlayer(props: PanelProps & {
     const target = room.anchorMediaSec - remaining / 1000;
     const state = p.getPlayerState();
     setNotice("დაკვრა მოთხოვნილია. თუ ხმა არ ისმის, ვიდეოში დააჭირე ▶.");
-    if (prepared.current === room.version && -remaining < 200 && localAction !== "resync") {
+    if (prepared.current === room.version && -remaining < 200) {
       p.playVideo();
     } else if (state === 1 || state === 2 || state === 3) {
       p.seekTo(target, true);
@@ -157,6 +191,7 @@ function ActivePlayer(props: PanelProps & {
 
     function fail(message: string) {
       if (disposed) return;
+      finishManual();
       ready.current = false;
       cancel();
       setIsReady(false);
@@ -186,7 +221,10 @@ function ActivePlayer(props: PanelProps & {
           const state = labels[data] ?? "UNKNOWN";
           report(state);
           if (state === "BUFFERING") setNotice("ეს ტელეფონი ვიდეოს ტვირთავს.");
-          if (state === "ENDED") setNotice("ვიდეო დასრულდა.");
+          if (state === "ENDED") { finishManual(); setNotice("ვიდეო დასრულდა."); }
+          if (state === "PAUSED" || state === "CUED" || state === "UNSTARTED") {
+            finishManual("პლეერი შეჩერდა. როცა სიმღერა გაისმება, ხელახლა სცადე.");
+          }
           if (state === "PLAYING") {
             const afterBlock = awaitingNativePlay.current;
             awaitingNativePlay.current = false;
@@ -197,9 +235,9 @@ function ActivePlayer(props: PanelProps & {
               applied.current = latest.current.room.version;
               held.current = false;
             }
-            setNotice(afterBlock
+            if (!manual.current) setNotice(afterBlock
               ? "როცა ძირითად სიმღერას გაიგონებ, დააჭირე „ხელახლა სინქრონიზაციას“, რომ ოთახის მიმდინარე პოზიციაზე გადახვიდე."
-              : "თუ სიმღერის რიტმი აცდა, ხელახლა შეუსაბამე მხოლოდ ეს ტელეფონი.");
+              : "თუ რიტმი აცდა, ძირითადი სიმღერის დროს დააჭირე „ხელახლა სინქრონიზაციას“.");
           }
           if (state === "PAUSED" && previous === "PLAYING" && latest.current.room.playing &&
               applied.current === latest.current.room.version) {
@@ -211,6 +249,7 @@ function ActivePlayer(props: PanelProps & {
           if (disposed) return;
           held.current = true;
           awaitingNativePlay.current = true;
+          finishManual();
           cancel();
           report("AUTOPLAY_BLOCKED");
           setNotice("ხმის ჩასართავად თავად YouTube ვიდეოში დააჭირე ▶. სიმღერის დაწყების შემდეგ შეგიძლია ხელახლა სინქრონიზაცია.");
@@ -222,16 +261,17 @@ function ActivePlayer(props: PanelProps & {
       } });
     }).catch(() => fail("YouTube პლეერის ჩატვირთვა ვერ მოხერხდა. შეამოწმე კავშირი და კვლავ სცადე."));
 
-    // Reading the playhead is diagnostic only. This interval never seeks,
-    // changes playback rate, or retries a rejected playback request.
+    // Apart from one bounded, explicitly requested resync, polling is read-only.
     const poll = window.setInterval(() => {
       if (ready.current) report(lastState.current);
+      tickManual();
     }, 350);
     const visible = new IntersectionObserver(() => reconcile(), { threshold: [0, 0.5, 0.51, 1] });
     visible.observe(node);
     function onVisibility() {
       if (!document.hidden) { reconcile(); return; }
       cancel();
+      finishManual();
       if (ready.current && latest.current.room.playing && player.current) {
         held.current = true;
         player.current.pauseVideo();
@@ -241,6 +281,7 @@ function ActivePlayer(props: PanelProps & {
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       disposed = true;
+      finishManual();
       ready.current = false;
       cancel();
       window.clearTimeout(watchdog);
@@ -251,12 +292,13 @@ function ActivePlayer(props: PanelProps & {
       player.current = null;
       node.replaceChildren();
     };
-  }, [generation, cancel, reconcile, report]);
+  }, [generation, cancel, finishManual, reconcile, report, tickManual]);
 
   useEffect(() => {
+    if (!props.connected || manual.current?.roomVersion !== props.room.version) finishManual();
     reconcile();
     return cancel;
-  }, [props.room.version, props.connected, props.optedIn, props.role, reconcile, cancel]);
+  }, [props.room.version, props.connected, props.optedIn, props.role, reconcile, cancel, finishManual]);
 
   function enable() {
     props.optIn();
@@ -264,13 +306,47 @@ function ActivePlayer(props: PanelProps & {
     reconcile("join");
   }
 
+  function resync() {
+    const { room, serverNow } = latest.current;
+    const p = player.current;
+    const now = serverNow();
+    if (!p || manual.current || now === null || now < room.anchorServerMs) {
+      setNotice("დაელოდე ოთახის საათს და საერთო სტარტს.");
+      return;
+    }
+    if (!sufficientlyVisible(stage.current)) {
+      setNotice("სინქრონიზაციისთვის ეკრანზე გამოაჩინე YouTube პლეერი.");
+      return;
+    }
+    if (awaitingNativePlay.current) {
+      setNotice("თავად ვიდეოში დააჭირე ▶. როცა რეკლამა დასრულდება და სიმღერას გაიგონებ, ხელახლა დააჭირე სინქრონიზაციას.");
+      return;
+    }
+    const state = p.getPlayerState();
+    if (state !== 1) {
+      setNotice("როცა ძირითადი სიმღერა გაისმება, ხელახლა დააჭირე სინქრონიზაციას. საჭიროებისას ვიდეოში დააჭირე ▶.");
+      if (state === 2 || state === 5 || state === -1) {
+        held.current = false;
+        awaitingNativePlay.current = true;
+        p.playVideo();
+      }
+      return;
+    }
+    held.current = false;
+    applied.current = room.version;
+    manual.current = new YouTubeResync(room.version, performance.now());
+    setChecking(true);
+    setNotice("ამ ტელეფონის პლეერის პოზიცია მოწმდება…");
+    tickManual();
+  }
+
   return <>
     <div className="player-stage" ref={stage} />
     <div className="player-controls">
       {props.role !== "host" && !props.optedIn &&
         <button className="btn btn-primary" disabled={!isReady || !props.connected} onClick={enable}>ხმის ჩართვა ამ ტელეფონზე</button>}
-      <button className="btn btn-secondary" disabled={!isReady || !props.connected || !props.room.playing ||
-        (!props.optedIn && props.role !== "host")} onClick={() => reconcile("resync")}>ხელახლა სინქრონიზაცია</button>
+      <button className="btn btn-secondary" disabled={checking || !isReady || !props.connected || !props.room.playing ||
+        (!props.optedIn && props.role !== "host")} onClick={resync}>{checking ? "პოზიცია მოწმდება…" : "ხელახლა სინქრონიზაცია"}</button>
       {fault && <button className="btn btn-secondary" onClick={() => setGeneration(n => n + 1)}>პლეერის თავიდან ჩატვირთვა</button>}
     </div>
     <p className="status-note" role="status">{fault || notice}</p>

@@ -14,6 +14,11 @@ export function roomApiUrl(): string {
   return new URL('/api/rooms', roomServerOrigin()).href
 }
 
+export function mediaFileUrl(roomId: string, fileId?: string): string {
+  const resource = '/api/rooms/' + encodeURIComponent(roomId) + '/audio'
+  return new URL(fileId ? resource + '/' + encodeURIComponent(fileId) : resource, roomServerOrigin()).href
+}
+
 export function roomSocketUrl(): string {
   const url = new URL('/ws', roomServerOrigin())
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'

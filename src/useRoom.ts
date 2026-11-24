@@ -3,13 +3,14 @@ import { SessionClock, type RoomSnapshot } from './protocol'
 import { roomSocketUrl } from './endpoints'
 
 export type { RoomSnapshot } from './protocol'
-export type RoomAction = 'track' | 'play' | 'pause'
+export type RoomAction = 'track' | 'play' | 'pause' | 'end'
 export type Role = 'host' | 'guest'
 
 type ServerMessage =
   | { type: 'welcome'; room: RoomSnapshot; role: Role; participants: number }
   | { type: 'state'; room: RoomSnapshot }
   | { type: 'presence'; participants: number }
+  | { type: 'readiness'; fileId: string | null; ready: number }
   | { type: 'pong'; id: string; t1: number; t2: number; t3: number }
   | { type: 'error'; code: string; message: string; room?: RoomSnapshot; requestId?: string }
 
@@ -19,7 +20,7 @@ function explainError(code: string) {
     case 'forbidden': return 'ამ ოთახის მართვა მხოლოდ მასპინძელს შეუძლია.'
     case 'stale_version': return 'ოთახის მდგომარეობა შეიცვალა. გადაამოწმე და ხელახლა სცადე.'
     case 'invalid_video': return 'ვიდეოს ბმული ვერ ამოვიცანით.'
-    case 'no_track': return 'ჯერ აირჩიე YouTube ვიდეო.'
+    case 'no_track': return 'ჯერ აირჩიე ტრეკი.'
     default: return 'ოთახმა მოთხოვნა ვერ შეასრულა. გადაამოწმე მდგომარეობა და ხელახლა სცადე.'
   }
 }
@@ -29,6 +30,8 @@ export function useRoom(roomId: string, hostToken: string | null) {
   const [role, setRole] = useState<Role>('guest')
   const [connected, setConnected] = useState(false)
   const [participants, setParticipants] = useState(0)
+  const [readyCount, setReadyCount] = useState(0)
+  const localReady = useRef<{ fileId: string; ready: boolean } | null>(null)
   const [rtt, setRtt] = useState<number | null>(null)
   const [clockReady, setClockReady] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -40,6 +43,13 @@ export function useRoom(roomId: string, hostToken: string | null) {
   const pending = useRef<{ requestId: string; version: number; timeout: number } | null>(null)
 
   const serverNow = useCallback(() => clock.current.now(performance.now()), [])
+  const reportFileReady = useCallback((fileId: string, ready: boolean) => {
+    if (snapshot.current && snapshot.current.file?.id !== fileId) return
+    localReady.current = { fileId, ready }
+    if (snapshot.current?.file?.id === fileId && socket.current?.readyState === WebSocket.OPEN) {
+      socket.current.send(JSON.stringify({ type: 'fileReady', fileId, ready }))
+    }
+  }, [])
   const clearCommand = useCallback(() => {
     if (pending.current) window.clearTimeout(pending.current.timeout)
     pending.current = null
@@ -63,11 +73,14 @@ export function useRoom(roomId: string, hostToken: string | null) {
       setClockReady(false)
       setRtt(null)
       setParticipants(0)
+      setReadyCount(0)
       clearCommand()
     }
 
     function acceptSnapshot(value: RoomSnapshot) {
       if (value.id !== roomId || (snapshot.current && value.version < snapshot.current.version)) return
+      if (snapshot.current?.file?.id !== value.file?.id) setReadyCount(0)
+      if (localReady.current && localReady.current.fileId !== value.file?.id) localReady.current = null
       snapshot.current = value
       setRoom(value)
       if (pending.current && value.version > pending.current.version) clearCommand()
@@ -125,12 +138,18 @@ export function useRoom(roomId: string, hostToken: string | null) {
             setParticipants(message.participants)
             setConnected(true)
             setError(null)
+            if (localReady.current?.fileId === message.room.file?.id && localReady.current) {
+              ws.send(JSON.stringify({ type: 'fileReady', ...localReady.current }))
+            }
             break
           case 'state':
             acceptSnapshot(message.room)
             break
           case 'presence':
             setParticipants(message.participants)
+            break
+          case 'readiness':
+            if (message.fileId === snapshot.current?.file?.id) setReadyCount(message.ready)
             break
           case 'pong': {
             const sent = probes.get(message.id)
@@ -221,5 +240,5 @@ export function useRoom(roomId: string, hostToken: string | null) {
     return true
   }, [clearCommand])
 
-  return { room, role, connected, participants, rtt, clockReady, serverNow, error, sendCommand, commandPending }
+  return { room, role, connected, participants, readyCount, reportFileReady, rtt, clockReady, serverNow, error, sendCommand, commandPending }
 }

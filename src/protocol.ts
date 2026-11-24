@@ -1,7 +1,15 @@
+export interface AudioFileInfo {
+  id: string
+  name: string
+  mime: string
+  size: number
+}
+
 export interface RoomSnapshot {
   id: string
   version: number
   videoId: string | null
+  file?: AudioFileInfo | null
   playing: boolean
   anchorServerMs: number
   anchorMediaSec: number

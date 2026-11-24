@@ -11,6 +11,8 @@ import "@fontsource-variable/noto-sans-georgian";
 import "@fontsource/barlow-condensed/latin-700.css";
 import "./style.css";
 import YouTubePanel from "./YouTubePanel";
+import FilePlayer from "./FilePlayer";
+import FileUpload from "./FileUpload";
 import { roomApiUrl } from "./endpoints";
 import { parseYoutubeId } from "./links";
 import { useRoom, type RoomSnapshot } from "./useRoom";
@@ -118,8 +120,8 @@ function Home({ enter }: { enter: (id: string) => void }) {
               <span>მოსმენა</span>
             </h1>
             <p>
-              ერთი YouTube სიმღერა რამდენიმე ტელეფონზე. შექმენი ოთახი და
-              მეგობრები ბმულით ან QR კოდით შემოიყვანე.
+              დაუკარი ერთი ტრეკი რამდენიმე ტელეფონზე. ატვირთე აუდიოფაილი ან
+              აირჩიე YouTube ვიდეო და მეგობრებს ოთახის ბმული გაუზიარე.
             </p>
             <button
               className="btn btn-primary create-button"
@@ -245,7 +247,7 @@ function TrackForm({
   return (
     <form onSubmit={submit} className="track-form">
       <label htmlFor="yt-link">
-        {current ? "ტრეკის შეცვლა" : "აირჩიე ტრეკი"}
+        {current ? "YouTube ვიდეოს შეცვლა" : "YouTube ვიდეოს ბმული"}
       </label>
       <div className="input-line">
         <input
@@ -278,7 +280,7 @@ function TrackForm({
   );
 }
 
-type Telemetry = { position: number | null; state: string };
+type Telemetry = { position: number | null; state: string; duration?: number };
 const names: Record<string, string> = {
   PLAYING: "უკრავს",
   PAUSED: "პაუზა",
@@ -290,11 +292,15 @@ const names: Record<string, string> = {
   WAITING: "მოლოდინი",
   AUTOPLAY_BLOCKED: "შეხებაა საჭირო",
   LOADING: "იტვირთება",
-  EMPTY: "ვიდეო არ არის",
+  EMPTY: "ტრეკი არ არის",
+  READY: "მზადაა",
+  SCHEDULED: "სტარტი დანიშნულია",
+  SUSPENDED: "დაკვრა შეჩერებულია",
+  DECODING: "აუდიო მზადდება",
   UNKNOWN: "უცნობია",
 };
 function target(room: RoomSnapshot | null, now: number | null) {
-  if (!room?.videoId || now === null) return null;
+  if (!room || !(room.videoId || room.file) || now === null) return null;
   return (
     room.anchorMediaSec +
     (room.playing ? Math.max(0, (now - room.anchorServerMs) / 1000) : 0)
@@ -312,7 +318,8 @@ function mediaTime(value: number | null) {
   );
 }
 function Room({ id }: { id: string }) {
-  const session = useRoom(id, hostKey(id));
+  const token = hostKey(id);
+  const session = useRoom(id, token);
   const { room, role, connected, serverNow, sendCommand, commandPending } =
     session;
   const latest = useRef({ room, serverNow });
@@ -323,6 +330,14 @@ function Room({ id }: { id: string }) {
     target: number | null;
   }>({ v: -1, data: { position: null, state: "WAITING" }, target: null });
   const [now, setNow] = useState<number | null>(null);
+  const [source, setSource] = useState<"file" | "youtube" | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [localReady, setLocalReady] = useState<string | null>(null);
+  const onReadyChange = useCallback((fileId: string, ready: boolean) => {
+    if (ready) setLocalReady(fileId);
+    else setLocalReady(current => current === fileId ? null : current);
+    session.reportFileReady(fileId, ready);
+  }, [session.reportFileReady]);
   const onTelemetry = useCallback((data: Telemetry) => {
     const { room: r, serverNow: clock } = latest.current;
     setSample({ v: r?.version ?? -1, data, target: target(r, clock()) });
@@ -334,10 +349,14 @@ function Room({ id }: { id: string }) {
     return () => clearInterval(timer);
   }, [serverNow]);
   const isHost = role === "host";
+  const sourceTab = source ?? (room?.videoId ? "youtube" : "file");
   const waiting = room?.playing && now !== null && now < room.anchorServerMs;
   const active = connected && session.clockReady && !commandPending;
   const matched = sample.v === room?.version;
   const d = matched ? sample.data : { position: null, state: "WAITING" };
+  useEffect(() => {
+    if (isHost && active && room?.file && room.playing && matched && d.state === "ENDED") sendCommand("end");
+  }, [isHost, active, room, matched, d.state, sendCommand]);
   const drift =
     connected &&
     matched &&
@@ -375,16 +394,28 @@ function Room({ id }: { id: string }) {
         )}
         <div className="room-grid">
           <div className="room-left">
-            {isHost && (
+            {isHost && room && token && (
               <div className="panel track-panel">
-                <TrackForm
+                <div className="source-choice" role="group" aria-label="ტრეკის წყარო">
+                  <button type="button" disabled={uploading} aria-pressed={sourceTab === "file"}
+                    onClick={() => setSource("file")}>აუდიოფაილი</button>
+                  <button type="button" disabled={uploading} aria-pressed={sourceTab === "youtube"}
+                    onClick={() => setSource("youtube")}>YouTube</button>
+                </div>
+                {sourceTab === "file" ? (
+                  <FileUpload room={room} token={token} busy={uploading} setBusy={setUploading}
+                    disabled={!connected || commandPending} />
+                ) : <TrackForm
                   current={room?.videoId ?? null}
                   choose={(v) => sendCommand("track", v)}
                   disabled={!connected || commandPending}
-                />
+                />}
               </div>
             )}
-            {room ? (
+            {room?.file ? (
+              <FilePlayer key={room.file.id} room={room} connected={connected} serverNow={serverNow}
+                onTelemetry={onTelemetry} onReadyChange={onReadyChange} />
+            ) : room ? (
               <YouTubePanel
                 room={room}
                 role={role}
@@ -411,14 +442,18 @@ function Room({ id }: { id: string }) {
                       ? "საერთო სტარტი დანიშნულია"
                       : room.playing
                         ? "ოთახში მუსიკა უკრავს"
-                        : room.videoId
+                        : room.videoId || room.file
                           ? "ტრეკი შერჩეულია"
-                          : "ჯერ აირჩიე ვიდეო"}
+                          : "ჯერ აირჩიე ტრეკი"}
                   </p>
+                  {room.file && <p className="status-note" aria-live="polite">
+                    მზადაა {session.readyCount} / {session.participants} ტელეფონი
+                  </p>}
                 </div>
                 <button
                   className="btn btn-primary"
-                  disabled={!room.videoId || !active}
+                  disabled={!(room.videoId || room.file) || !active || uploading ||
+                    (!!room.file && !room.playing && localReady !== room.file.id)}
                   onClick={() => sendCommand(room.playing ? "pause" : "play")}
                 >
                   <span aria-hidden="true">{room.playing ? "Ⅱ" : "▶"}</span>
@@ -439,8 +474,8 @@ function Room({ id }: { id: string }) {
                       ? "—"
                       : Math.round(session.rtt) + " ms",
                   ],
-                  ["სამიზნე პოზიცია", mediaTime(target(room, now))],
-                  ["YouTube-ის პოზიცია", mediaTime(d.position)],
+                  ["სამიზნე პოზიცია", mediaTime(matched && d.position !== null ? sample.target : target(room, now))],
+                  [room?.file ? "ფაილის პოზიცია" : "YouTube-ის პოზიცია", mediaTime(d.position)],
                   ["პლეერის მდგომარეობა", names[d.state] ?? d.state],
                   ["პლეერის შეფასებული აცდენა", driftText],
                 ].map(([k, v]) => (
@@ -455,7 +490,9 @@ function Room({ id }: { id: string }) {
                 რომ პლეერი სამიზნეს უსწრებს. დინამიკიდან ხმის გამოსვლის დრო
                 ცალკე სიდიდეა.
               </p>
-              <p className="baseline">ავტომატური კორექცია გამორთულია</p>
+              {(room?.file || room?.videoId) && <p className="baseline">{room.file
+                ? "ფაილის დაკვრისას ავტომატური კორექცია ჩართულია"
+                : "YouTube-ზე კორექცია მხოლოდ ხელით სინქრონიზაციისას მუშაობს"}</p>}
             </section>
           </aside>
         </div>

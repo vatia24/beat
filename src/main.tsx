@@ -1,0 +1,488 @@
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
+import { createRoot } from "react-dom/client";
+import QRCode from "qrcode";
+import "@fontsource-variable/noto-sans-georgian";
+import "@fontsource/barlow-condensed/latin-700.css";
+import "./style.css";
+import YouTubePanel from "./YouTubePanel";
+import { roomApiUrl } from "./endpoints";
+import { parseYoutubeId } from "./links";
+import { useRoom, type RoomSnapshot } from "./useRoom";
+
+const credentials = new Map<string, string>();
+function hostKey(id: string) {
+  try {
+    return credentials.get(id) ?? sessionStorage.getItem("beatroom-host-" + id);
+  } catch {
+    return credentials.get(id) ?? null;
+  }
+}
+function rememberHost(id: string, token: string) {
+  credentials.set(id, token);
+  try {
+    sessionStorage.setItem("beatroom-host-" + id, token);
+  } catch {
+    /* The current tab still owns the room. */
+  }
+}
+
+function Brand() {
+  return (
+    <a href="/" className="brand" aria-label="Beatroom — მთავარი">
+      <img src="/beatroom.svg" width="34" height="34" alt="" />
+      <span>BEATROOM</span>
+    </a>
+  );
+}
+function Header({ room }: { room?: string }) {
+  return (
+    <header className="site-header">
+      <div className="header-inner">
+        <Brand />
+        <span className="header-context">
+          {room ? (
+            <>
+              ოთახი <b>{room.slice(0, 6).toUpperCase()}</b>
+            </>
+          ) : (
+            "მოსასმენი ოთახები"
+          )}
+        </span>
+      </div>
+    </header>
+  );
+}
+function Cover() {
+  return (
+    <div className="cover" aria-hidden="true">
+      <div className="cover-grid" />
+      <div className="sleeve">
+        <div className="disc">
+          <div className="disc-grooves" />
+          <div className="disc-label">
+            <i />
+          </div>
+        </div>
+        <div className="jacket">
+          <div className="jacket-graphic">
+            <i />
+            <i />
+            <i />
+            <i />
+            <i />
+            <i />
+            <i />
+            <i />
+            <i />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+function Home({ enter }: { enter: (id: string) => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function createRoom() {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(roomApiUrl(), { method: "POST" });
+      if (!response.ok) throw new Error();
+      const { roomId, hostToken } = await response.json();
+      if (typeof hostToken !== "string" || !/^[a-f0-9]{12}$/.test(roomId))
+        throw new Error();
+      rememberHost(roomId, hostToken);
+      enter(roomId);
+    } catch {
+      setError("ოთახი ვერ შეიქმნა. შეამოწმე კავშირი და ხელახლა სცადე.");
+      setBusy(false);
+    }
+  }
+  return (
+    <>
+      <Header />
+      <main className="home">
+        <section className="lobby-card">
+          <div className="lobby-copy">
+            <h1>
+              საერთო
+              <br />
+              <span>მოსმენა</span>
+            </h1>
+            <p>
+              ერთი YouTube სიმღერა რამდენიმე ტელეფონზე. შექმენი ოთახი და
+              მეგობრები ბმულით ან QR კოდით შემოიყვანე.
+            </p>
+            <button
+              className="btn btn-primary create-button"
+              onClick={createRoom}
+              disabled={busy}
+            >
+              <span aria-hidden="true">＋</span>
+              {busy ? "იქმნება…" : "ოთახის შექმნა"}
+            </button>
+            {error && (
+              <p className="error" role="alert">
+                {error}
+              </p>
+            )}
+          </div>
+          <Cover />
+        </section>
+        <div className="home-note">
+          <span className="note-icon" aria-hidden="true">
+            ♪
+          </span>
+          <p>
+            სტუმარი ოთახში გაზიარებული ბმულით შედის და ხმას საკუთარ ტელეფონზე
+            რთავს.
+          </p>
+        </div>
+      </main>
+    </>
+  );
+}
+
+function Share({ id }: { id: string }) {
+  const link = new URL("/r/" + id, location.origin).href;
+  const [qr, setQr] = useState("");
+  const [status, setStatus] = useState("");
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    let active = true;
+    QRCode.toDataURL(link, {
+      margin: 4,
+      width: 256,
+      errorCorrectionLevel: "M",
+      color: { dark: "#161916", light: "#ffffff" },
+    })
+      .then((url) => {
+        if (active) setQr(url);
+      })
+      .catch(() => {
+        if (active) setStatus("გამოიყენე ოთახის ბმული.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [link]);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(link);
+      setStatus("ბმული დაკოპირდა.");
+    } catch {
+      input.current?.focus();
+      input.current?.select();
+      setStatus("მონიშნული ბმული დააკოპირე.");
+    }
+  }
+  return (
+    <section className="panel share-panel">
+      <h2 className="panel-title">მოიწვიე მეგობარი</h2>
+      <div className="share-content">
+        {qr && (
+          <img
+            className="qr"
+            src={qr}
+            alt="ოთახში შესასვლელი QR კოდი"
+            width="140"
+            height="140"
+          />
+        )}
+        <p>დაასკანერე QR ან გახსენი ოთახის ბმული მეორე ტელეფონზე.</p>
+      </div>
+      <div className="copy-line">
+        <input
+          ref={input}
+          aria-label="ოთახის ბმული"
+          readOnly
+          value={link}
+          dir="ltr"
+        />
+        <button className="btn btn-secondary" onClick={copy}>
+          კოპირება
+        </button>
+      </div>
+      {status && (
+        <p role="status" className="status-note">
+          {status}
+        </p>
+      )}
+    </section>
+  );
+}
+function TrackForm({
+  choose,
+  disabled,
+  current,
+}: {
+  choose: (id: string) => boolean;
+  disabled: boolean;
+  current: string | null;
+}) {
+  const [value, setValue] = useState("");
+  const [error, setError] = useState("");
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    const parsed = parseYoutubeId(value.trim());
+    if (!parsed) {
+      setError("ჩასვი YouTube ვიდეოს სრული ბმული.");
+      return;
+    }
+    if (choose(parsed)) {
+      setError("");
+      setValue("");
+    }
+  }
+  return (
+    <form onSubmit={submit} className="track-form">
+      <label htmlFor="yt-link">
+        {current ? "ტრეკის შეცვლა" : "აირჩიე ტრეკი"}
+      </label>
+      <div className="input-line">
+        <input
+          id="yt-link"
+          type="text"
+          inputMode="url"
+          autoCapitalize="none"
+          spellCheck={false}
+          placeholder="https://www.youtube.com/watch?v=…"
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setError("");
+          }}
+        />
+        <button
+          type="submit"
+          className="btn btn-secondary"
+          disabled={disabled || !value.trim()}
+        >
+          არჩევა
+        </button>
+      </div>
+      {error && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
+    </form>
+  );
+}
+
+type Telemetry = { position: number | null; state: string };
+const names: Record<string, string> = {
+  PLAYING: "უკრავს",
+  PAUSED: "პაუზა",
+  CUED: "ვიდეო არჩეულია",
+  BUFFERING: "იტვირთება",
+  ENDED: "დასრულდა",
+  UNSTARTED: "არ დაწყებულა",
+  ERROR: "შეცდომა",
+  WAITING: "მოლოდინი",
+  AUTOPLAY_BLOCKED: "შეხებაა საჭირო",
+  LOADING: "იტვირთება",
+  EMPTY: "ვიდეო არ არის",
+  UNKNOWN: "უცნობია",
+};
+function target(room: RoomSnapshot | null, now: number | null) {
+  if (!room?.videoId || now === null) return null;
+  return (
+    room.anchorMediaSec +
+    (room.playing ? Math.max(0, (now - room.anchorServerMs) / 1000) : 0)
+  );
+}
+function mediaTime(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return "—";
+  const n = Math.max(0, Math.floor(value * 10));
+  return (
+    Math.floor(n / 600) +
+    ":" +
+    String(Math.floor(n / 10) % 60).padStart(2, "0") +
+    "." +
+    (n % 10)
+  );
+}
+function Room({ id }: { id: string }) {
+  const session = useRoom(id, hostKey(id));
+  const { room, role, connected, serverNow, sendCommand, commandPending } =
+    session;
+  const latest = useRef({ room, serverNow });
+  latest.current = { room, serverNow };
+  const [sample, setSample] = useState<{
+    v: number;
+    data: Telemetry;
+    target: number | null;
+  }>({ v: -1, data: { position: null, state: "WAITING" }, target: null });
+  const [now, setNow] = useState<number | null>(null);
+  const onTelemetry = useCallback((data: Telemetry) => {
+    const { room: r, serverNow: clock } = latest.current;
+    setSample({ v: r?.version ?? -1, data, target: target(r, clock()) });
+  }, []);
+  useEffect(() => {
+    const tick = () => setNow(serverNow());
+    tick();
+    const timer = window.setInterval(tick, 250);
+    return () => clearInterval(timer);
+  }, [serverNow]);
+  const isHost = role === "host";
+  const waiting = room?.playing && now !== null && now < room.anchorServerMs;
+  const active = connected && session.clockReady && !commandPending;
+  const matched = sample.v === room?.version;
+  const d = matched ? sample.data : { position: null, state: "WAITING" };
+  const drift =
+    connected &&
+    matched &&
+    room?.playing &&
+    !waiting &&
+    d.state === "PLAYING" &&
+    d.position !== null &&
+    sample.target !== null
+      ? Math.round((d.position - sample.target) * 1000)
+      : null;
+  const driftText =
+    drift === null ? "—" : (drift > 0 ? "+" : "") + drift + " ms";
+  return (
+    <>
+      <Header room={id} />
+      <main className="room-main">
+        <div className="room-head">
+          <div>
+            <p className="room-role">
+              {isHost ? "მასპინძელი" : room ? "სტუმარი" : "დაკავშირება"}
+            </p>
+            <h1>მოსასმენი ოთახი</h1>
+          </div>
+          <span className={"presence " + (connected ? "online" : "")}>
+            <i />
+            {connected
+              ? session.participants + " მონაწილე"
+              : "კავშირი მყარდება"}
+          </span>
+        </div>
+        {session.error && (
+          <p className="error banner" role="alert">
+            {session.error}
+          </p>
+        )}
+        <div className="room-grid">
+          <div className="room-left">
+            {isHost && (
+              <div className="panel track-panel">
+                <TrackForm
+                  current={room?.videoId ?? null}
+                  choose={(v) => sendCommand("track", v)}
+                  disabled={!connected || commandPending}
+                />
+              </div>
+            )}
+            {room ? (
+              <YouTubePanel
+                room={room}
+                role={role}
+                connected={connected}
+                serverNow={serverNow}
+                onTelemetry={onTelemetry}
+              />
+            ) : (
+              <div className="panel">
+                <p>
+                  {session.error
+                    ? "ოთახის გახსნა ვერ მოხერხდა."
+                    : "ოთახის მონაცემები იტვირთება…"}
+                </p>
+                {session.error && <a href="/">მთავარზე დაბრუნება</a>}
+              </div>
+            )}
+            {isHost && room && (
+              <section className="panel transport">
+                <div>
+                  <h2 className="panel-title">ოთახის მართვა</h2>
+                  <p className="status-note" aria-live="polite">
+                    {waiting
+                      ? "საერთო სტარტი დანიშნულია"
+                      : room.playing
+                        ? "ოთახში მუსიკა უკრავს"
+                        : room.videoId
+                          ? "ტრეკი შერჩეულია"
+                          : "ჯერ აირჩიე ვიდეო"}
+                  </p>
+                </div>
+                <button
+                  className="btn btn-primary"
+                  disabled={!room.videoId || !active}
+                  onClick={() => sendCommand(room.playing ? "pause" : "play")}
+                >
+                  <span aria-hidden="true">{room.playing ? "Ⅱ" : "▶"}</span>
+                  {room.playing ? "ყველასთვის პაუზა" : "ყველასთვის დაკვრა"}
+                </button>
+              </section>
+            )}
+          </div>
+          <aside className="room-side">
+            {room && <Share id={id} />}
+            <section className="panel diagnostics">
+              <h2 className="panel-title">დიაგნოსტიკა</h2>
+              <dl>
+                {[
+                  [
+                    "კავშირის RTT",
+                    session.rtt === null
+                      ? "—"
+                      : Math.round(session.rtt) + " ms",
+                  ],
+                  ["სამიზნე პოზიცია", mediaTime(target(room, now))],
+                  ["YouTube-ის პოზიცია", mediaTime(d.position)],
+                  ["პლეერის მდგომარეობა", names[d.state] ?? d.state],
+                  ["პლეერის შეფასებული აცდენა", driftText],
+                ].map(([k, v]) => (
+                  <div key={k}>
+                    <dt>{k}</dt>
+                    <dd>{v}</dd>
+                  </div>
+                ))}
+              </dl>
+              <p className="status-note">
+                აცდენა ითვლება პლეერის პოზიციით. დადებითი მნიშვნელობა ნიშნავს,
+                რომ პლეერი სამიზნეს უსწრებს. დინამიკიდან ხმის გამოსვლის დრო
+                ცალკე სიდიდეა.
+              </p>
+              <p className="baseline">ავტომატური კორექცია გამორთულია</p>
+            </section>
+          </aside>
+        </div>
+      </main>
+    </>
+  );
+}
+function App() {
+  const [path, setPath] = useState(location.pathname);
+  useEffect(() => {
+    const f = () => setPath(location.pathname);
+    window.addEventListener("popstate", f);
+    return () => window.removeEventListener("popstate", f);
+  }, []);
+  const id = path.match(/^\/r\/([a-f0-9]{12})\/?$/)?.[1];
+  return id ? (
+    <Room key={id} id={id} />
+  ) : (
+    <Home
+      enter={(roomId) => {
+        const url = "/r/" + roomId;
+        history.pushState(null, "", url);
+        setPath(url);
+        window.scrollTo(0, 0);
+      }}
+    />
+  );
+}
+
+createRoot(document.getElementById("root")!).render(<App />);

@@ -7,7 +7,7 @@ const source = await readFile(new URL('../src/file-clock.ts', import.meta.url), 
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
 })
-const { DriftController, OutputClock, RateHistory, startPoint } = await import(
+const { DriftController, OutputClock, RateHistory, startPoint, voiceAction } = await import(
   'data:text/javascript;base64,' + Buffer.from(outputText).toString('base64')
 )
 const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-8, `${a} vs ${b}`)
@@ -19,6 +19,29 @@ test('future start preserves the attack, late join advances the offset to its ou
   const joined = startPoint(2000, 8, 10000, 5.96, 6)
   near(joined.when, 6.08)
   near(joined.offset, 16.12)
+})
+
+test('speaker offset advances scheduled output without skipping attack samples', () => {
+  const first = startPoint(11960, 0, 10000, 5.96, 6)
+  near(first.offset, 0)
+  near(first.when, 7.96 - 0.04)
+  const joined = startPoint(1960, 8, 10000, 5.96, 6)
+  near(joined.offset, 16.16)
+  const delayed = startPoint(12040, 0, 10000, 5.96, 6)
+  near(delayed.when, 8)
+  near(delayed.offset, 0)
+  const shortLead = startPoint(10020, 0, 10000, 5.96, 6)
+  near(shortLead.when, 6.08)
+  near(shortLead.offset, 0.1)
+})
+
+test('hidden rendering continues while a missed revision waits for clock', () => {
+  const input = { canRender: true, roomPlaying: true, roomVersion: 1, appliedVersion: 1, clockFresh: false, force: false }
+  assert.equal(voiceAction(input), 'keep')
+  assert.equal(voiceAction({ ...input, roomVersion: 2 }), 'wait')
+  assert.equal(voiceAction({ ...input, roomVersion: 2, clockFresh: true }), 'schedule')
+  assert.equal(voiceAction({ ...input, roomPlaying: false }), 'stop')
+  assert.equal(voiceAction({ ...input, canRender: false }), 'stop')
 })
 
 test('output mapping requires advancing, fresh timestamps and avoids double-counting latency', () => {

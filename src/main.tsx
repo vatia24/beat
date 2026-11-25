@@ -12,8 +12,9 @@ import "@fontsource/barlow-condensed/latin-700.css";
 import "./style.css";
 import YouTubePanel from "./YouTubePanel";
 import FilePlayer from "./FilePlayer";
+import HostSyncPanel from "./HostSyncPanel";
 import FileUpload from "./FileUpload";
-import { roomApiUrl } from "./endpoints";
+import { roomApiUrl, youtubeSearchUrl, catalogUrl } from "./endpoints";
 import { parseYoutubeId } from "./links";
 import { useRoom, type RoomSnapshot } from "./useRoom";
 
@@ -221,63 +222,105 @@ function Share({ id }: { id: string }) {
     </section>
   );
 }
-function TrackForm({
-  choose,
-  disabled,
-  current,
-}: {
+function TrackForm({ choose, chooseCatalog, disabled, current }: {
   choose: (id: string) => boolean;
+  chooseCatalog: (id: string) => boolean;
   disabled: boolean;
   current: string | null;
 }) {
   const [value, setValue] = useState("");
   const [error, setError] = useState("");
-  function submit(e: FormEvent) {
+  const [results, setResults] = useState<{ id: string; title: string; channel: string; thumbnail: string }[]>([]);
+  const [catalog, setCatalog] = useState<{ id: string; name: string; youtubeId: string | null }[]>([]);
+  const [matchedVideo, setMatchedVideo] = useState<string | null>(null);
+  const [searching, setSearching] = useState(false);
+  const controller = useRef<AbortController | null>(null);
+  useEffect(() => () => controller.current?.abort(), []);
+
+  async function submit(e: FormEvent) {
     e.preventDefault();
-    const parsed = parseYoutubeId(value.trim());
-    if (!parsed) {
-      setError("ჩასვი YouTube ვიდეოს სრული ბმული.");
+    const query = value.trim();
+    const videoId = parseYoutubeId(query);
+    if (videoId) {
+      controller.current?.abort();
+      const request = new AbortController();
+      controller.current = request;
+      setSearching(true);
+      setMatchedVideo(videoId);
+      setResults([]);
+      setCatalog([]);
+      try {
+        const response = await fetch(catalogUrl('', videoId), { signal: request.signal });
+        if (!response.ok) throw new Error();
+        const data = await response.json();
+        if (!request.signal.aborted) setCatalog(data.results ?? []);
+      } catch {
+        if (!request.signal.aborted) setError('კატალოგის შემოწმება ვერ მოხერხდა. YouTube-ის არჩევა შეგიძლიათ.');
+      } finally {
+        if (controller.current === request) { controller.current = null; setSearching(false); }
+      }
       return;
     }
-    if (choose(parsed)) {
-      setError("");
-      setValue("");
+    if (query.length < 2) { setError("ჩაწერეთ სიმღერის სახელი ან YouTube ბმული."); return; }
+    controller.current?.abort();
+    const request = new AbortController();
+    controller.current = request;
+    setSearching(true);
+    setResults([]);
+    setError("");
+    try {
+      const [own, youtube] = await Promise.allSettled([
+        fetch(catalogUrl(query), { signal: request.signal }),
+        fetch(youtubeSearchUrl(query), { signal: request.signal }),
+      ]);
+      if (request.signal.aborted) return;
+      if (own.status === 'fulfilled' && own.value.ok) {
+        const data = await own.value.json();
+        setCatalog(Array.isArray(data.results) ? data.results : []);
+      }
+      if (youtube.status === 'fulfilled' && youtube.value.ok) {
+        const data = await youtube.value.json();
+        setResults(Array.isArray(data.results) ? data.results : []);
+      } else if (own.status !== 'fulfilled' || !own.value.ok) {
+        setError('ძიება ვერ შესრულდა. ჩასვით YouTube ბმული.');
+      }
+    } catch (reason) {
+      if (!request.signal.aborted) setError(reason instanceof Error ? reason.message : "ძიება ვერ შესრულდა.");
+    } finally {
+      if (controller.current === request) { controller.current = null; setSearching(false); }
     }
   }
-  return (
-    <form onSubmit={submit} className="track-form">
-      <label htmlFor="yt-link">
-        {current ? "YouTube ვიდეოს შეცვლა" : "YouTube ვიდეოს ბმული"}
-      </label>
-      <div className="input-line">
-        <input
-          id="yt-link"
-          type="text"
-          inputMode="url"
-          autoCapitalize="none"
-          spellCheck={false}
-          placeholder="https://www.youtube.com/watch?v=…"
-          value={value}
-          onChange={(e) => {
-            setValue(e.target.value);
-            setError("");
-          }}
-        />
-        <button
-          type="submit"
-          className="btn btn-secondary"
-          disabled={disabled || !value.trim()}
-        >
-          არჩევა
-        </button>
-      </div>
-      {error && (
-        <p className="error" role="alert">
-          {error}
-        </p>
-      )}
-    </form>
-  );
+
+  return <form onSubmit={submit} className="track-form">
+    <label htmlFor="yt-link">{current ? "მოძებნეთ ან შეცვალეთ ვიდეო" : "სიმღერის ძიება ან YouTube ბმული"}</label>
+    <div className="input-line">
+      <input id="yt-link" type="text" autoCapitalize="none" spellCheck={false}
+        placeholder="სიმღერის სახელი ან YouTube ბმული" value={value}
+        onChange={e => { setValue(e.target.value); setError(""); setResults([]); setCatalog([]); setMatchedVideo(null); controller.current?.abort(); }} />
+      <button type="submit" className="btn btn-secondary" disabled={disabled || searching || !value.trim()}>
+        {searching ? "იძებნება…" : "არჩევა"}
+      </button>
+    </div>
+    {error && <p className="error" role="alert">{error}</p>}
+    {catalog.length > 0 && <><p className="status-note">Beatroom-ის აუდიო · ზუსტი პლეერი</p>
+      <ul className="youtube-results">{catalog.map(item => <li key={item.id}>
+        <button type="button" className="youtube-result" disabled={disabled} onClick={() => {
+          if (chooseCatalog(item.id)) { setCatalog([]); setResults([]); setMatchedVideo(null); setValue(''); }
+        }}>{item.name} · Beatroom-ის პლეერით დაკვრა</button>
+      </li>)}</ul></>}
+    {matchedVideo && <button type="button" className="btn btn-secondary" disabled={disabled} onClick={() => {
+      if (choose(matchedVideo)) { setCatalog([]); setMatchedVideo(null); setValue(''); }
+    }}>YouTube-ის ხილული პლეერით დაკვრა</button>}
+    {results.length > 0 && <p className="status-note">YouTube · მიახლოებითი სინქრონიზაცია</p>}
+    {results.length > 0 && <ul className="youtube-results">{results.map(item => <li key={item.id}>
+      <button type="button" className="youtube-result" disabled={disabled} onClick={() => {
+        if (choose(item.id)) { setResults([]); setValue(""); }
+      }}>
+        {item.thumbnail && <img src={item.thumbnail} width="80" height="60" alt="" />}
+        <span><strong>{item.title}</strong><br />{item.channel}</span>
+      </button>
+    </li>)}</ul>}
+  </form>;
 }
 
 type Telemetry = { position: number | null; state: string; duration?: number };
@@ -338,10 +381,12 @@ function Room({ id }: { id: string }) {
     else setLocalReady(current => current === fileId ? null : current);
     session.reportFileReady(fileId, ready);
   }, [session.reportFileReady]);
+  const endSentFor = useRef(-1);
   const onTelemetry = useCallback((data: Telemetry) => {
     const { room: r, serverNow: clock } = latest.current;
     setSample({ v: r?.version ?? -1, data, target: target(r, clock()) });
   }, []);
+  const onPlaybackSample = session.reportPlaybackSample;
   useEffect(() => {
     const tick = () => setNow(serverNow());
     tick();
@@ -355,7 +400,13 @@ function Room({ id }: { id: string }) {
   const matched = sample.v === room?.version;
   const d = matched ? sample.data : { position: null, state: "WAITING" };
   useEffect(() => {
-    if (isHost && active && room?.file && room.playing && matched && d.state === "ENDED") sendCommand("end");
+    if (!room?.file) endSentFor.current = -1;
+  }, [room?.file?.id]);
+  useEffect(() => {
+    if (!isHost || !active || !room?.file || !room.playing || !matched || d.state !== "ENDED") return;
+    if (endSentFor.current === room.version) return;
+    endSentFor.current = room.version;
+    sendCommand("end", undefined, { version: room.version });
   }, [isHost, active, room, matched, d.state, sendCommand]);
   const drift =
     connected &&
@@ -408,13 +459,15 @@ function Room({ id }: { id: string }) {
                 ) : <TrackForm
                   current={room?.videoId ?? null}
                   choose={(v) => sendCommand("track", v)}
+                  chooseCatalog={(id) => sendCommand("catalog", undefined, { catalogId: id })}
                   disabled={!connected || commandPending}
                 />}
               </div>
             )}
             {room?.file ? (
-              <FilePlayer key={room.file.id} room={room} connected={connected} serverNow={serverNow}
-                onTelemetry={onTelemetry} onReadyChange={onReadyChange} />
+              <FilePlayer key={room.file.id} room={room} connected={connected} clockReady={session.clockReady}
+                serverNow={serverNow} onTelemetry={onTelemetry} onReadyChange={onReadyChange}
+                onPlaybackSample={onPlaybackSample} />
             ) : room ? (
               <YouTubePanel
                 room={room}
@@ -433,6 +486,10 @@ function Room({ id }: { id: string }) {
                 {session.error && <a href="/">მთავარზე დაბრუნება</a>}
               </div>
             )}
+            {isHost && room?.file && (
+              <HostSyncPanel room={room} roster={session.roster} samples={session.participantSamples}
+                nowMs={now} />
+            )}
             {isHost && room && (
               <section className="panel transport">
                 <div>
@@ -450,15 +507,29 @@ function Room({ id }: { id: string }) {
                     მზადაა {session.readyCount} / {session.participants} ტელეფონი
                   </p>}
                 </div>
-                <button
-                  className="btn btn-primary"
-                  disabled={!(room.videoId || room.file) || !active || uploading ||
-                    (!!room.file && !room.playing && localReady !== room.file.id)}
-                  onClick={() => sendCommand(room.playing ? "pause" : "play")}
-                >
-                  <span aria-hidden="true">{room.playing ? "Ⅱ" : "▶"}</span>
-                  {room.playing ? "ყველასთვის პაუზა" : "ყველასთვის დაკვრა"}
-                </button>
+                <div className="transport-actions">
+                  <button
+                    className="btn btn-primary"
+                    disabled={!(room.videoId || room.file) || !active || uploading ||
+                      (!!room.file && !room.playing && (localReady !== room.file.id ||
+                        session.readyCount < session.participants))}
+                    onClick={() => sendCommand(room.playing ? "pause" : "play", undefined,
+                      room.file && !room.playing ? { startPolicy: "together" } : undefined)}
+                  >
+                    <span aria-hidden="true">{room.playing ? "Ⅱ" : "▶"}</span>
+                    {room.playing ? "ყველასთვის პაუზა" : "საერთო სტარტი (ყველა ტელეფონი)"}
+                  </button>
+                  {room.file && !room.playing && (
+                    <button
+                      className="btn btn-secondary"
+                      disabled={!(room.file) || !active || uploading || session.readyCount < 1 ||
+                        localReady !== room.file.id}
+                      onClick={() => sendCommand("play", undefined, { startPolicy: "ready" })}
+                    >
+                      მზად ტელეფონებით დაკვრა
+                    </button>
+                  )}
+                </div>
               </section>
             )}
           </div>

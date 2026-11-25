@@ -91,6 +91,7 @@ test('room clock, authorization, idempotency, pause and independent late join', 
   third.ws.close();
   assert.equal((await host.next('presence')).participants, 2);
   assert.equal((await guest.next('presence')).participants, 2);
+  assert.equal((await host.next('participantGone')).participantId.length, 8);
 
   command('pause', 2, 'D');
   const paused = (await host.next('state')).room;

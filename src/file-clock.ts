@@ -5,6 +5,7 @@ export class OutputClock {
   private previous: AudioTimestamp | null = null
   private advancing = false
   usingTimestamp = false
+  method: 'timestamp' | 'latency' | 'unavailable' = 'unavailable'
 
   read(ctx: AudioContext, nowMs: number): number {
     const stamp = ctx.getOutputTimestamp?.()
@@ -22,16 +23,24 @@ export class OutputClock {
       const estimated = stamp.contextTime + age / 1000
       if (this.advancing && estimated >= 0 && estimated < ctx.currentTime + 0.03) {
         this.usingTimestamp = true
+        this.method = 'timestamp'
         return estimated
       }
     }
     this.usingTimestamp = false
+    this.method = Number.isFinite(ctx.outputLatency) && ctx.outputLatency > 0 ? 'latency' : 'unavailable'
     const latency = (v: number) => Number.isFinite(v) && v >= 0 && v <= 2 ? v : 0
     return ctx.currentTime - latency(ctx.baseLatency) - latency(ctx.outputLatency)
   }
 }
 
-export function startPoint(anchorMs: number, anchorSec: number, serverMs: number, outputSec: number, renderSec: number) {
+export function startPoint(
+  anchorMs: number,
+  anchorSec: number,
+  serverMs: number,
+  outputSec: number,
+  renderSec: number,
+) {
   // A late participant starts a little in the future at the position the room
   // will reach then. A start announced sufficiently far ahead keeps offset zero.
   const delaySec = Math.max((anchorMs - serverMs) / 1000, renderSec - outputSec + 0.08)
@@ -39,6 +48,15 @@ export function startPoint(anchorMs: number, anchorSec: number, serverMs: number
     when: outputSec + delaySec,
     offset: anchorSec + Math.max(0, (serverMs - anchorMs) / 1000 + delaySec),
   }
+}
+
+export function voiceAction(i: {
+  canRender: boolean; roomPlaying: boolean; roomVersion: number;
+  appliedVersion: number; clockFresh: boolean; force: boolean
+}): 'keep' | 'stop' | 'schedule' | 'wait' {
+  if (!i.canRender || !i.roomPlaying) return 'stop'
+  if (i.roomVersion === i.appliedVersion && !i.force) return 'keep'
+  return i.clockFresh ? 'schedule' : 'wait'
 }
 
 // Changes take effect on the render clock. Position at the estimated output

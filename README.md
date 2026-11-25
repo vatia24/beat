@@ -43,3 +43,21 @@ Vercel Functions-ში WebSocket მხარდაჭერა 2026 წლი�
 5. **ათი წუთი.** ცალკე გაშვებაზე მოუსმინე ათი წუთი ხელით ჩარევის გარეშე. ჩაინიშნე პირველი გასაგონი ორმაგი დარტყმის, ხმის წყვეტის ან შესამჩნევი რიტმული აცდენის დრო. ავტომატური კორექცია გამორთულია. საბაზისო ცდის დასრულების შემდეგ, მხოლოდ იმ ტელეფონზე, რომლის გასწორებაც გინდა, დააჭირე **ხელახლა სინქრონიზაცია** და კვლავ შეაფასე ხმა. მეორე ტელეფონი დაკვრას აგრძელებს.
 
 დიაგნოსტიკაში **კავშირის RTT** არის სერვერთან მიმოსვლის დრო. **პლეერის შეფასებული აცდენა** არის YouTube-ის პოზიცია მინუს იმავე მომენტისთვის გამოთვლილი სამიზნე პოზიცია. დადებითი მნიშვნელობა პლეერის წინ ყოფნას ნიშნავს. დინამიკებიდან დარტყმის დამთხვევა შეაფასე მოსმენით. ერთი მოწყობილობის რეკლამა, ჩატვირთვა ან დაბრუნება ოთახის პაუზას არ იწვევს.
+# Optional Beatroom audio catalog
+
+Set `AUDIO_CATALOG_DIR` on the Node room server to an absolute directory on persistent storage. Add audio files and a `manifest.json` array. The server reads the manifest at startup. Restart it after changing the catalog. Uploading a file to a room still makes it available only in that room and does not add it to the catalog.
+
+```json
+[
+  {
+    "id": "sample-song",
+    "file": "Sample.wav",
+    "title": "Sample Song",
+    "rights": "Playback permission held by the catalog operator",
+    "youtubeId": "abcdefghijk"
+  }
+]
+```
+
+The `youtubeId` field is optional. It links the supplied recording to a YouTube URL for host confirmation. The audio is served from `Sample.wav`, never fetched from YouTube. Catalog files must be MP3, WAV, or M4A and at most 32 MiB each. Keep the catalog directory mounted on persistent storage in production. Configure `YOUTUBE_API_KEY` on the room server to enable YouTube text search. YouTube URLs still work without that key.
+

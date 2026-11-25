@@ -1,18 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { SessionClock, type RoomSnapshot } from './protocol'
 import { roomSocketUrl } from './endpoints'
+import type { PlaybackSamplePayload, StoredSample } from './sync-diagnostics'
 
 export type { RoomSnapshot } from './protocol'
-export type RoomAction = 'track' | 'play' | 'pause' | 'end'
+export type RoomAction = 'track' | 'catalog' | 'play' | 'pause' | 'end'
 export type Role = 'host' | 'guest'
+export type StartPolicy = 'together' | 'ready'
 
 type ServerMessage =
-  | { type: 'welcome'; room: RoomSnapshot; role: Role; participants: number }
+  | { type: 'welcome'; room: RoomSnapshot; role: Role; participants: number; participantId: string; roster: RosterEntry[] }
   | { type: 'state'; room: RoomSnapshot }
-  | { type: 'presence'; participants: number }
+  | { type: 'presence'; participants: number; roster: RosterEntry[] }
   | { type: 'readiness'; fileId: string | null; ready: number }
   | { type: 'pong'; id: string; t1: number; t2: number; t3: number }
+  | { type: 'participantSample'; participantId: string; role: Role; sample: PlaybackSamplePayload; receivedAt: number }
+  | { type: 'participantGone'; participantId: string }
   | { type: 'error'; code: string; message: string; room?: RoomSnapshot; requestId?: string }
+
+export interface RosterEntry {
+  participantId: string
+  role: Role
+}
 
 function explainError(code: string) {
   switch (code) {
@@ -21,6 +30,7 @@ function explainError(code: string) {
     case 'stale_version': return 'ოთახის მდგომარეობა შეიცვალა. გადაამოწმე და ხელახლა სცადე.'
     case 'invalid_video': return 'ვიდეოს ბმული ვერ ამოვიცანით.'
     case 'no_track': return 'ჯერ აირჩიე ტრეკი.'
+    case 'not_ready': return 'ჯერ ყველა საჭირო ტელეფონი არ არის მზად. შეამოწმე პანელი და ხელახლა სცადე.'
     default: return 'ოთახმა მოთხოვნა ვერ შეასრულა. გადაამოწმე მდგომარეობა და ხელახლა სცადე.'
   }
 }
@@ -31,6 +41,9 @@ export function useRoom(roomId: string, hostToken: string | null) {
   const [connected, setConnected] = useState(false)
   const [participants, setParticipants] = useState(0)
   const [readyCount, setReadyCount] = useState(0)
+  const [participantId, setParticipantId] = useState('')
+  const [roster, setRoster] = useState<RosterEntry[]>([])
+  const [participantSamples, setParticipantSamples] = useState<Map<string, StoredSample>>(new Map())
   const localReady = useRef<{ fileId: string; ready: boolean } | null>(null)
   const [rtt, setRtt] = useState<number | null>(null)
   const [clockReady, setClockReady] = useState(false)
@@ -50,6 +63,12 @@ export function useRoom(roomId: string, hostToken: string | null) {
       socket.current.send(JSON.stringify({ type: 'fileReady', fileId, ready }))
     }
   }, [])
+  const reportPlaybackSample = useCallback((payload: PlaybackSamplePayload) => {
+    const ws = socket.current
+    if (ws?.readyState !== WebSocket.OPEN) return
+    if (snapshot.current?.file?.id !== payload.fileId || snapshot.current?.version !== payload.version) return
+    ws.send(JSON.stringify({ type: 'playbackSample', ...payload }))
+  }, [])
   const clearCommand = useCallback(() => {
     if (pending.current) window.clearTimeout(pending.current.timeout)
     pending.current = null
@@ -67,6 +86,7 @@ export function useRoom(roomId: string, hostToken: string | null) {
 
     function resetConnection() {
       snapshot.current = null
+      localReady.current = null
       canControl.current = false
       clock.current.reset()
       setConnected(false)
@@ -74,16 +94,38 @@ export function useRoom(roomId: string, hostToken: string | null) {
       setRtt(null)
       setParticipants(0)
       setReadyCount(0)
+      setParticipantId('')
+      setRoster([])
+      setParticipantSamples(new Map())
       clearCommand()
     }
 
     function acceptSnapshot(value: RoomSnapshot) {
       if (value.id !== roomId || (snapshot.current && value.version < snapshot.current.version)) return
-      if (snapshot.current?.file?.id !== value.file?.id) setReadyCount(0)
+      if (snapshot.current?.file?.id !== value.file?.id) {
+        setReadyCount(0)
+        setParticipantSamples(new Map())
+        }
       if (localReady.current && localReady.current.fileId !== value.file?.id) localReady.current = null
       snapshot.current = value
       setRoom(value)
       if (pending.current && value.version > pending.current.version) clearCommand()
+    }
+
+    function applyRoster(entries: RosterEntry[]) {
+      setRoster(entries)
+      setParticipantSamples(prev => {
+        const ids = new Set(entries.map(e => e.participantId))
+        let changed = false
+        const next = new Map(prev)
+        for (const key of prev.keys()) {
+          if (!ids.has(key)) {
+            next.delete(key)
+            changed = true
+          }
+        }
+        return changed ? next : prev
+      })
     }
 
     function connect() {
@@ -111,7 +153,15 @@ export function useRoom(roomId: string, hostToken: string | null) {
         const id = String(++seq)
         for (const [key, sent] of probes) if (t1 - sent > 20_000) probes.delete(key)
         probes.set(id, t1)
-        setClockReady(clock.current.now(t1) !== null)
+        const fresh = clock.current.now(t1) !== null
+        setClockReady(fresh)
+        if (!fresh && localReady.current?.ready) {
+          const fileId = localReady.current.fileId
+          localReady.current = { fileId, ready: false }
+          if (snapshot.current?.file?.id === fileId) {
+            ws.send(JSON.stringify({ type: 'fileReady', fileId, ready: false }))
+          }
+        }
         ws.send(JSON.stringify({ type: 'ping', id, t1 }))
         window.clearTimeout(sampleTimer)
         sampleTimer = window.setTimeout(ping, seq < 7 || !clock.current.now(t1) ? 300 : 2500)
@@ -136,6 +186,8 @@ export function useRoom(roomId: string, hostToken: string | null) {
             canControl.current = message.role === 'host'
             setRole(message.role)
             setParticipants(message.participants)
+            setParticipantId(message.participantId)
+            applyRoster(message.roster)
             setConnected(true)
             setError(null)
             if (localReady.current?.fileId === message.room.file?.id && localReady.current) {
@@ -147,9 +199,32 @@ export function useRoom(roomId: string, hostToken: string | null) {
             break
           case 'presence':
             setParticipants(message.participants)
+            applyRoster(message.roster)
             break
           case 'readiness':
             if (message.fileId === snapshot.current?.file?.id) setReadyCount(message.ready)
+            break
+          case 'participantSample':
+            if (message.sample.fileId !== snapshot.current?.file?.id) break
+            setParticipantSamples(prev => {
+              const next = new Map(prev)
+              next.set(message.participantId, {
+                participantId: message.participantId,
+                role: message.role,
+                receivedAt: message.receivedAt,
+                payload: message.sample,
+                sampleServerMs: message.sample.serverMs,
+              })
+              return next
+            })
+            break
+          case 'participantGone':
+            setParticipantSamples(prev => {
+              if (!prev.has(message.participantId)) return prev
+              const next = new Map(prev)
+              next.delete(message.participantId)
+              return next
+            })
             break
           case 'pong': {
             const sent = probes.get(message.id)
@@ -158,7 +233,15 @@ export function useRoom(roomId: string, hostToken: string | null) {
             lastReply = received
             const roundTrip = clock.current.add(sent, message.t2, message.t3, received)
             if (roundTrip !== null) setRtt(roundTrip)
-            setClockReady(clock.current.now(received) !== null)
+            const fresh = clock.current.now(received) !== null
+            setClockReady(fresh)
+            if (!fresh && localReady.current?.ready) {
+              const fileId = localReady.current.fileId
+              localReady.current = { fileId, ready: false }
+              if (snapshot.current?.file?.id === fileId) {
+                ws.send(JSON.stringify({ type: 'fileReady', fileId, ready: false }))
+              }
+            }
             break
           }
           case 'error':
@@ -223,7 +306,7 @@ export function useRoom(roomId: string, hostToken: string | null) {
     }
   }, [roomId, hostToken, clearCommand])
 
-  const sendCommand = useCallback((action: RoomAction, videoId?: string) => {
+  const sendCommand = useCallback((action: RoomAction, videoId?: string, options?: { startPolicy?: StartPolicy; version?: number; catalogId?: string }) => {
     const ws = socket.current
     const state = snapshot.current
     if (!ws || ws.readyState !== WebSocket.OPEN || !state || !canControl.current || pending.current) return false
@@ -236,9 +319,34 @@ export function useRoom(roomId: string, hostToken: string | null) {
     pending.current = { requestId, version: state.version, timeout }
     setCommandPending(true)
     setError(null)
-    ws.send(JSON.stringify({ type: 'command', action, videoId, version: state.version, requestId }))
+    ws.send(JSON.stringify({
+      type: 'command',
+      action,
+      videoId,
+      ...(action === 'catalog' ? { catalogId: options?.catalogId } : {}),
+      version: options?.version ?? state.version,
+      requestId,
+      ...(action === 'play' && state.file ? { startPolicy: options?.startPolicy ?? 'together' } : {}),
+    }))
     return true
   }, [clearCommand])
 
-  return { room, role, connected, participants, readyCount, reportFileReady, rtt, clockReady, serverNow, error, sendCommand, commandPending }
+  return {
+    room,
+    role,
+    connected,
+    participants,
+    readyCount,
+    participantId,
+    roster,
+    participantSamples,
+    reportFileReady,
+    reportPlaybackSample,
+    rtt,
+    clockReady,
+    serverNow,
+    error,
+    sendCommand,
+    commandPending,
+  }
 }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { RoomSnapshot } from "./protocol";
 import { loadYouTubeApi, type YouTubePlayer } from "./youtube-api";
 import { YouTubeResync } from "./youtube-resync";
+import { YouTubeAutoSync } from "./youtube-auto-sync";
 
 export interface YouTubeTelemetry {
   position: number | null;
@@ -53,6 +54,10 @@ function ActivePlayer(props: PanelProps & {
   const awaitingNativePlay = useRef(false);
   const pending = useRef<number | undefined>(undefined);
   const manual = useRef<YouTubeResync | null>(null);
+  const automatic = useRef(new YouTubeAutoSync());
+  const [autoSync, setAutoSync] = useState(true);
+  const autoSyncEnabled = useRef(autoSync);
+  autoSyncEnabled.current = autoSync;
   const [checking, setChecking] = useState(false);
   const [notice, setNotice] = useState("YouTube პლეერი იტვირთება.");
   const [fault, setFault] = useState("");
@@ -166,6 +171,7 @@ function ActivePlayer(props: PanelProps & {
     let disposed = false;
     let instance: YouTubePlayer | null = null;
     const { videoId } = latest.current;
+    automatic.current.reset();
     ready.current = false;
     held.current = false;
     awaitingNativePlay.current = false;
@@ -261,10 +267,26 @@ function ActivePlayer(props: PanelProps & {
       } });
     }).catch(() => fail("YouTube პლეერის ჩატვირთვა ვერ მოხერხდა. შეამოწმე კავშირი და კვლავ სცადე."));
 
-    // Apart from one bounded, explicitly requested resync, polling is read-only.
+    // Correct stable large errors with a long cooldown; the visible iframe owns playback.
     const poll = window.setInterval(() => {
       if (ready.current) report(lastState.current);
       tickManual();
+      const { room, connected, serverNow } = latest.current;
+      const p = player.current;
+      const now = serverNow();
+      if (!autoSyncEnabled.current || manual.current || !p || !ready.current || !connected || !room.playing ||
+          applied.current !== room.version || held.current || awaitingNativePlay.current ||
+          !sufficientlyVisible(stage.current) || now === null || now < room.anchorServerMs ||
+          p.getPlayerState() !== 1 || p.getPlaybackRate() !== 1) {
+        automatic.current.reset();
+        return;
+      }
+      const target = room.anchorMediaSec + (now - room.anchorServerMs) / 1000;
+      const seek = automatic.current.sample(performance.now(), target, p.getCurrentTime(), p.getDuration());
+      if (seek !== null) {
+        p.seekTo(seek, true);
+        setNotice('შესამჩნევი ჩამორჩენა გასწორდა. YouTube-ის სინქრონიზაცია მიახლოებითია.');
+      }
     }, 350);
     const visible = new IntersectionObserver(() => reconcile(), { threshold: [0, 0.5, 0.51, 1] });
     visible.observe(node);
@@ -295,6 +317,7 @@ function ActivePlayer(props: PanelProps & {
   }, [generation, cancel, finishManual, reconcile, report, tickManual]);
 
   useEffect(() => {
+    automatic.current.reset();
     if (!props.connected || manual.current?.roomVersion !== props.room.version) finishManual();
     reconcile();
     return cancel;
@@ -343,6 +366,7 @@ function ActivePlayer(props: PanelProps & {
   return <>
     <div className="player-stage" ref={stage} />
     <div className="player-controls">
+      <label><input type="checkbox" checked={autoSync} onChange={e => setAutoSync(e.target.checked)} /> დიდი აცდენის ავტომატური გასწორება</label>
       {props.role !== "host" && !props.optedIn &&
         <button className="btn btn-primary" disabled={!isReady || !props.connected} onClick={enable}>ხმის ჩართვა ამ ტელეფონზე</button>}
       <button className="btn btn-secondary" disabled={checking || !isReady || !props.connected || !props.room.playing ||
@@ -350,6 +374,7 @@ function ActivePlayer(props: PanelProps & {
       {fault && <button className="btn btn-secondary" onClick={() => setGeneration(n => n + 1)}>პლეერის თავიდან ჩატვირთვა</button>}
     </div>
     <p className="status-note" role="status">{fault || notice}</p>
+    <p className="status-note">YouTube-ის ხილული პლეერი. სინქრონიზაცია მიახლოებითია.</p>
   </>;
 }
 

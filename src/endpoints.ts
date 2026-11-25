@@ -14,6 +14,19 @@ export function roomApiUrl(): string {
   return new URL('/api/rooms', roomServerOrigin()).href
 }
 
+export function youtubeSearchUrl(query: string): string {
+  const url = new URL('/api/youtube/search', roomServerOrigin())
+  url.searchParams.set('q', query)
+  return url.href
+}
+
+export function catalogUrl(query = '', youtubeId = ''): string {
+  const url = new URL('/api/catalog', roomServerOrigin())
+  if (query) url.searchParams.set('q', query)
+  if (youtubeId) url.searchParams.set('youtubeId', youtubeId)
+  return url.href
+}
+
 export function mediaFileUrl(roomId: string, fileId?: string): string {
   const resource = '/api/rooms/' + encodeURIComponent(roomId) + '/audio'
   return new URL(fileId ? resource + '/' + encodeURIComponent(fileId) : resource, roomServerOrigin()).href

@@ -3,6 +3,9 @@ import { on, once } from 'node:events';
 import { request } from 'node:http';
 import test from 'node:test';
 import { WebSocket } from 'ws';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { createBeatroomServer } from '../server/index.mjs';
 
 const frontend = 'https://beatroom.example';
@@ -24,6 +27,62 @@ function pcmWav() {
   return b;
 }
 const wav = pcmWav();
+
+test('catalog persists across room server restarts and selected audio uses file player', { timeout: 8000 }, async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'beatroom-catalog-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(path.join(directory, 'Song.wav'), wav);
+  await writeFile(path.join(directory, 'manifest.json'), JSON.stringify([
+    { id: 'song-1', file: 'Song.wav', title: 'Sample Song', rights: 'Provided by catalog operator', youtubeId: 'abcdefghijk' },
+  ]));
+  const { room, server } = await setup(t, { catalogDirectory: directory });
+  const { url, join } = await room();
+  const base = 'http://127.0.0.1:' + server.address().port;
+  const catalog = await fetch(base + '/api/catalog?youtubeId=abcdefghijk', { headers: { Origin: frontend } });
+  assert.equal(catalog.status, 200);
+  assert.equal((await catalog.json()).results[0].id, 'song-1');
+  const host = await join(true);
+  host.send({ type: 'command', action: 'catalog', catalogId: 'song-1', version: 0, requestId: 'catalog-selection' });
+  const selected = (await host.next('state')).room;
+  assert.equal(selected.file.id, 'song-1');
+  assert.equal(selected.videoId, null);
+  const sound = await fetch(url + '/song-1', { headers: { Origin: frontend } });
+  assert.equal(sound.status, 200);
+  assert.deepEqual(Buffer.from(await sound.arrayBuffer()), wav);
+  const another = createBeatroomServer({ catalogDirectory: directory });
+  t.after(() => another.close().catch(() => {}));
+  another.server.listen(0, '127.0.0.1');
+  await once(another.server, 'listening');
+  const repeated = await fetch('http://127.0.0.1:' + another.server.address().port + '/api/catalog?q=sample');
+  assert.equal((await repeated.json()).results[0].id, 'song-1');
+});
+
+test('stale readiness cannot start everyone and an old end cannot stop a new session', { timeout: 8000 }, async t => {
+  let time = 100;
+  const { room } = await setup(t, { now: () => time });
+  const { join, put } = await room();
+  const host = await join(true);
+  const guest = await join(false);
+  const uploaded = await put(0);
+  const { room: snapshot } = await uploaded.json();
+  await host.take('state');
+  await guest.take('state');
+  host.send({ type: 'fileReady', fileId: snapshot.file.id, ready: true });
+  guest.send({ type: 'fileReady', fileId: snapshot.file.id, ready: true });
+  await host.take('readiness');
+  await host.take('readiness');
+  time += 9000;
+  host.send({ type: 'ping', id: 'fresh', t1: time });
+  await host.take('pong');
+  host.send({ type: 'command', action: 'play', startPolicy: 'together', version: 1, requestId: 'all' });
+  assert.equal((await host.take('error')).code, 'not_ready');
+  host.send({ type: 'command', action: 'play', startPolicy: 'ready', version: 1, requestId: 'some' });
+  const playing = (await host.take('state')).room;
+  assert.equal(playing.version, 2);
+  host.send({ type: 'command', action: 'end', version: 1, requestId: 'old-end' });
+  assert.equal((await host.take('error')).code, 'stale_version');
+  assert.equal(playing.playing, true);
+});
 
 async function setup(t, options = {}) {
   const app = createBeatroomServer({ publicOrigin: frontend, ...options });
@@ -52,7 +111,14 @@ async function setup(t, options = {}) {
         assert.equal(msg.type, type, JSON.stringify(msg));
         return msg;
       }
-      return { ws, next, send, welcome: await next('welcome') };
+      async function take(...types) {
+        for (;;) {
+          const item = await frames.next();
+          const msg = JSON.parse(item.value[0]);
+          if (types.includes(msg.type)) return msg;
+        }
+      }
+      return { ws, next, send, take, welcome: await next('welcome') };
     }
     return { url, headers, put, join };
   }
@@ -71,8 +137,8 @@ test('host file upload, CORS and public bytes, independent readiness, play, rewi
   assert.equal((await put(0, wav, { Authorization: 'Bearer wrong' })).status, 403);
   assert.equal((await put(0, wav, { Origin: 'https://other.example' })).status, 403);
   assert.equal((await put(-1)).status, 400);
-  assert.equal((await put(0, Buffer.from('ID3arbitrary text'))).status, 415);
-  assert.equal((await put(0, wav, { 'content-type': 'text/plain' })).status, 415);
+  assert.equal((await put(0, Buffer.alloc(64, 0))).status, 415);
+  assert.equal((await put(0, Buffer.alloc(32, 0), { 'content-type': 'text/plain' })).status, 415);
 
   const selected = await put(0);
   assert.equal(selected.status, 200);
@@ -97,19 +163,24 @@ test('host file upload, CORS and public bytes, independent readiness, play, rewi
 
   host.send({ type: 'fileReady', fileId: id, ready: true });
   assert.equal((await host.next('readiness')).ready, 1);
-  host.send({ type: 'command', action: 'play', version: 1, requestId: 'p' });
+  const guest = await join();
+  assert.equal(guest.welcome.participants, 2);
+  assert.equal(guest.welcome.roster.length, 2);
+  await host.next('presence');
+  assert.equal((await guest.next('readiness')).ready, 1);
+  host.send({ type: 'command', action: 'play', version: 1, requestId: 'p', startPolicy: 'together' });
+  assert.equal((await host.next('error')).code, 'not_ready');
+  host.send({ type: 'command', action: 'play', version: 1, requestId: 'p2', startPolicy: 'ready' });
   const playing = (await host.next('state')).room;
   assert.equal(playing.playing, true);
-  const guest = await join();
-  assert.deepEqual(guest.welcome.room, playing);
-  assert.equal((await guest.next('readiness')).ready, 1);
-  await host.next('presence');
+  assert.deepEqual((await guest.take('state')).room, playing);
   guest.send({ type: 'fileReady', fileId: 'stale', ready: true });
   guest.send({ type: 'fileReady', fileId: id, ready: true });
   assert.equal((await host.next('readiness')).ready, 2);
   assert.equal((await guest.next('readiness')).ready, 2);
   guest.ws.close();
   await host.next('presence');
+  await host.next('participantGone');
   assert.equal((await host.next('readiness')).ready, 1);
   host.send({ type: 'command', action: 'end', version: 2, requestId: 'end' });
   const ended = (await host.next('state')).room;
@@ -158,12 +229,13 @@ test('in-flight reservations are bounded, recover after disconnects, and cannot 
     await once(ws, 'open');
     const frames = on(ws, 'message');
     ws.send(JSON.stringify({ type: 'join', roomId: url.split('/')[5], hostToken: headers.Authorization.slice(7) }));
-    await frames.next(); // welcome
+    const welcome = JSON.parse((await frames.next()).value[0].toString());
     await frames.next(); // readiness
-    return { ws, frames };
+    return { ws, frames, fileId: welcome.room.file.id, version: welcome.room.version };
   })();
   const stale = await partial();
-  host.ws.send(JSON.stringify({ type: 'command', action: 'play', version: 1, requestId: 'race' }));
+  host.ws.send(JSON.stringify({ type: 'fileReady', fileId: host.fileId, ready: true }));
+  host.ws.send(JSON.stringify({ type: 'command', action: 'play', version: host.version, requestId: 'race', startPolicy: 'ready' }));
   await host.frames.next();
   const finalResponse = once(stale.req, 'response');
   stale.req.end(wav.subarray(12));

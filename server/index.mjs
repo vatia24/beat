@@ -6,11 +6,12 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
 import { AudioRequestError, createAudioStore } from './audio-store.mjs';
+import { loadCatalog } from './catalog.mjs';
 
 const defaultDist = fileURLToPath(new URL('../dist/', import.meta.url));
 const roomRoute = /^\/r\/[a-f0-9]{12}\/?$/;
 const videoIdPattern = /^[A-Za-z0-9_-]{11}$/;
-const audioRoute = /^\/api\/rooms\/([a-f0-9]{12})\/audio(?:\/([a-f0-9]{32}))?$/;
+const audioRoute = /^\/api\/rooms\/([a-f0-9]{12})\/audio(?:\/([a-zA-Z0-9_-]{1,60}))?$/;
 const contentTypes = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -114,9 +115,12 @@ export function createBeatroomServer({
   distDirectory = defaultDist,
   publicOrigin = process.env.PUBLIC_ORIGIN,
   audioBudgetBytes,
+  catalogDirectory = process.env.AUDIO_CATALOG_DIR,
 } = {}) {
   const rooms = new Map();
+  const searchRequests = new Map();
   const audioStore = createAudioStore(audioBudgetBytes);
+  const catalog = loadCatalog(catalogDirectory);
   const dist = path.resolve(distDirectory);
   const origin = publicOrigin ? new URL(publicOrigin).origin : null;
   const wss = new WebSocketServer({ noServer: true, maxPayload: 8192, perMessageDeflate: false });
@@ -127,8 +131,58 @@ export function createBeatroomServer({
     room.readyMembers.clear();
   }
 
+  function liveReadyCount(room) {
+    return Array.from(room.readyMembers).filter(socket => room.members.has(socket) && now() - socket.lastSeenAt < 8000).length;
+  }
+
   function readiness(room) {
-    return { type: 'readiness', fileId: room.state.file.id, ready: room.readyMembers.size };
+    return { type: 'readiness', fileId: room.state.file.id, ready: liveReadyCount(room) };
+  }
+
+  function roster(room) {
+    return Array.from(room.sockets.entries()).map(([socket, meta]) => ({
+      participantId: meta.participantId,
+      role: meta.role,
+    }));
+  }
+
+  function sendHosts(room, message) {
+    for (const [socket, meta] of room.sockets) {
+      if (meta.role === 'host' && socket.readyState === WebSocket.OPEN) send(socket, message);
+    }
+  }
+
+  const timingMethods = new Set(['timestamp', 'latency', 'unavailable']);
+  const sampleStates = new Set([
+    'LOADING', 'DECODING', 'LOCKED', 'INTERRUPTED', 'WAITING', 'READY', 'PAUSED',
+    'SCHEDULED', 'PLAYING', 'ENDED', 'ERROR',
+  ]);
+
+  function validPlaybackSample(room, msg) {
+    const file = room.state.file;
+    if (!file || msg.fileId !== file.id || msg.version !== room.state.version) return null;
+    if (!sampleStates.has(msg.state) || !timingMethods.has(msg.timingMethod)) return null;
+    if (![undefined, null, 'decode', 'audio', 'clock'].includes(msg.waitFor)) return null;
+    if (typeof msg.clockFresh !== 'boolean' || typeof msg.startReady !== 'boolean') return null;
+    if (!Number.isFinite(msg.playbackRate) || msg.playbackRate < 0.5 || msg.playbackRate > 1.5) return null;
+    if (typeof msg.manualOffsetMs !== 'number' || Math.abs(msg.manualOffsetMs) > 250) return null;
+    const serverMs = msg.serverMs === null ? null : Number(msg.serverMs);
+    if (serverMs !== null && !Number.isFinite(serverMs)) return null;
+    const mediaSec = msg.mediaSec === null ? null : Number(msg.mediaSec);
+    if (mediaSec !== null && (!Number.isFinite(mediaSec) || mediaSec < 0 || mediaSec > 86_400)) return null;
+    return {
+      fileId: file.id,
+      version: room.state.version,
+      serverMs,
+      mediaSec,
+      playbackRate: msg.playbackRate,
+      state: msg.state,
+      clockFresh: msg.clockFresh,
+      timingMethod: msg.timingMethod,
+      manualOffsetMs: msg.manualOffsetMs,
+      startReady: msg.startReady,
+      waitFor: msg.waitFor ?? null,
+    };
   }
 
   function prune() {
@@ -148,6 +202,40 @@ export function createBeatroomServer({
       if (pathname === '/healthz' && (request.method === 'GET' || request.method === 'HEAD')) {
         return respond(response, 200, { ok: true });
       }
+      if (pathname === '/api/catalog') {
+        if (!allowApi(request, response, origin, ['GET'], 'Content-Type')) return;
+        const q = (searchParams.get('q') ?? '').trim().toLocaleLowerCase();
+        const youtubeId = searchParams.get('youtubeId');
+        if (q.length > 80 || (youtubeId && !videoIdPattern.test(youtubeId))) {
+          return respond(response, 400, { error: 'invalid_query' });
+        }
+        return respond(response, 200, { results: Array.from(catalog.values()).filter(item =>
+          (youtubeId ? item.youtubeId === youtubeId : !q || item.file.name.toLocaleLowerCase().includes(q)))
+          .slice(0, 20).map(item => ({ ...item.file, youtubeId: item.youtubeId })) });
+      }
+      if (pathname === '/api/youtube/search') {
+        if (!allowApi(request, response, origin, ['GET'], 'Content-Type')) return;
+        const query = searchParams.get('q')?.trim() ?? '';
+        if (query.length < 2 || query.length > 80) return respond(response, 400, { error: 'invalid_query' });
+        if (!process.env.YOUTUBE_API_KEY) return respond(response, 503, { error: 'search_unavailable' });
+        const address = request.socket.remoteAddress ?? 'unknown';
+        const previous = searchRequests.get(address) ?? -Infinity;
+        if (now() - previous < 5000) return respond(response, 429, { error: 'search_rate_limited' });
+        if (searchRequests.size > 4096) searchRequests.clear();
+        searchRequests.set(address, now());
+        const params = new URLSearchParams({ part: 'snippet', type: 'video', maxResults: '8', q: query,
+          key: process.env.YOUTUBE_API_KEY });
+        const upstream = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`, {
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!upstream.ok) return respond(response, 502, { error: 'search_failed' });
+        const data = await upstream.json();
+        return respond(response, 200, { results: (data.items ?? []).filter(item =>
+          /^[A-Za-z0-9_-]{11}$/.test(item.id?.videoId ?? '')).map(item => ({
+          id: item.id.videoId, title: item.snippet?.title ?? '', channel: item.snippet?.channelTitle ?? '',
+          thumbnail: item.snippet?.thumbnails?.default?.url ?? '',
+        })) });
+      }
       if (pathname === '/api/rooms' && (request.method === 'POST' || request.method === 'OPTIONS')) {
         if (!allowApi(request, response, origin, ['POST'], 'Content-Type')) return;
         if (rooms.size >= 4096) prune();
@@ -157,7 +245,7 @@ export function createBeatroomServer({
         const hostToken = randomBytes(32).toString('base64url');
         const created = now();
         const state = { id, version: 0, videoId: null, file: null, playing: false, anchorServerMs: created, anchorMediaSec: 0 };
-        rooms.set(id, { state, hostToken, members: new Set(), readyMembers: new Set(), audio: null, seen: new Set(), emptySince: created });
+        rooms.set(id, { state, hostToken, members: new Set(), readyMembers: new Set(), audio: null, seen: new Set(), emptySince: created, sockets: new Map() });
         return respond(response, 201, { roomId: id, hostToken });
       }
       const audioMatch = pathname.match(audioRoute);
@@ -220,6 +308,10 @@ export function createBeatroomServer({
   wss.on('connection', socket => {
     let room;
     let role;
+    socket.participantId = randomBytes(4).toString('hex');
+    socket.sampleTokens = 5;
+    socket.lastSampleAt = now();
+    socket.lastSeenAt = now();
     socket.alive = true;
     socket.on('pong', () => { socket.alive = true; });
     socket.on('error', () => socket.terminate());
@@ -231,6 +323,7 @@ export function createBeatroomServer({
 
     socket.on('message', (bytes, binary) => {
       const received = now();
+      socket.lastSeenAt = received;
       let msg;
       try {
         if (!binary) msg = JSON.parse(bytes.toString());
@@ -238,6 +331,10 @@ export function createBeatroomServer({
       if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return fail('invalid_message', 'შეტყობინების ფორმატი არასწორია.');
       if (msg.type === 'ping') {
         if (!Number.isFinite(msg.t1) || !['number', 'string'].includes(typeof msg.id)) return;
+        if (room?.state.file) {
+          const count = liveReadyCount(room);
+          if (count !== room.lastReadyCount) { room.lastReadyCount = count; broadcast(room, readiness(room)); }
+        }
         return send(socket, { type: 'pong', id: msg.id, t1: msg.t1, t2: received, t3: now() });
       }
       if (msg.type === 'join') {
@@ -249,9 +346,36 @@ export function createBeatroomServer({
         role = hostMatches(room.hostToken, msg.hostToken) ? 'host' : 'guest';
         clearTimeout(joinTimeout);
         room.members.add(socket);
-        send(socket, { type: 'welcome', room: room.state, role, participants: room.members.size });
+        room.sockets.set(socket, { participantId: socket.participantId, role });
+        send(socket, {
+          type: 'welcome',
+          room: room.state,
+          role,
+          participants: room.members.size,
+          participantId: socket.participantId,
+          roster: roster(room),
+        });
         if (room.state.file) send(socket, readiness(room));
-        if (isNew) broadcast(room, { type: 'presence', participants: room.members.size }, socket);
+        if (isNew) broadcast(room, { type: 'presence', participants: room.members.size, roster: roster(room) }, socket);
+        return;
+      }
+      if (msg.type === 'playbackSample') {
+        if (!room) return;
+        const sample = validPlaybackSample(room, msg);
+        if (!sample) return;
+        socket.sampleTokens = Math.min(5, socket.sampleTokens + (received - socket.lastSampleAt) / 1000);
+        socket.lastSampleAt = received;
+        if (socket.sampleTokens < 1) return;
+        socket.sampleTokens -= 1;
+        const meta = room.sockets.get(socket);
+        if (!meta) return;
+        sendHosts(room, {
+          type: 'participantSample',
+          participantId: meta.participantId,
+          role: meta.role,
+          sample,
+          receivedAt: received,
+        });
         return;
       }
       if (msg.type === 'fileReady') {
@@ -259,6 +383,7 @@ export function createBeatroomServer({
         if (room.readyMembers.has(socket) !== msg.ready) {
           if (msg.ready) room.readyMembers.add(socket);
           else room.readyMembers.delete(socket);
+          room.lastReadyCount = liveReadyCount(room);
           broadcast(room, readiness(room));
         }
         return;
@@ -273,7 +398,14 @@ export function createBeatroomServer({
       if (room.seen.has(requestId)) return send(socket, { type: 'state', room: room.state });
       const state = room.state;
       if (version !== state.version) return fail('stale_version', 'ოთახის მდგომარეობა განახლდა.', requestId, true);
-      if (action === 'track') {
+      if (action === 'catalog') {
+        const selected = typeof msg.catalogId === 'string' ? catalog.get(msg.catalogId) : null;
+        if (!selected) return fail('catalog_not_found', 'აუდიო კატალოგში ვერ მოიძებნა.', requestId);
+        releaseAudio(room);
+        room.audio = selected;
+        room.state = { ...state, videoId: null, file: selected.file, playing: false,
+          anchorMediaSec: 0, anchorServerMs: received };
+      } else if (action === 'track') {
         if (typeof videoId !== 'string' || !videoIdPattern.test(videoId)) {
           return fail('invalid_video', 'ვიდეოს იდენტიფიკატორი არასწორია.', requestId);
         }
@@ -285,6 +417,15 @@ export function createBeatroomServer({
         if (!state.videoId && !state.file) return fail('no_track', 'ჯერ აირჩიე ტრეკი.', requestId);
         const playing = action === 'play';
         if (state.playing === playing) return fail('no_change', 'ოთახი უკვე ამ მდგომარეობაშია.', requestId, true);
+        if (playing && state.file) {
+          const mode = msg.startPolicy === 'ready' ? 'ready' : 'together';
+          if (mode === 'together' && liveReadyCount(room) < room.members.size) {
+            return fail('not_ready', 'ყველა დაკავშირებული ტელეფონი ჯერ არ არის მზად.', requestId, true);
+          }
+          if (mode === 'ready' && liveReadyCount(room) < 1) {
+            return fail('not_ready', 'არც ერთი მზად ტელეფონი არ არის.', requestId, true);
+          }
+        }
         const elapsed = state.playing ? Math.max(0, received - state.anchorServerMs) / 1000 : 0;
         room.state = { ...state, playing, anchorMediaSec: state.anchorMediaSec + elapsed,
           anchorServerMs: received + (playing ? startLeadMs : 0) };
@@ -295,14 +436,18 @@ export function createBeatroomServer({
       room.seen.add(requestId);
       if (room.seen.size > 256) room.seen.delete(room.seen.values().next().value);
       broadcast(room, { type: 'state', room: room.state });
+      if (action === 'catalog') broadcast(room, readiness(room));
     });
 
     socket.on('close', () => {
       clearTimeout(joinTimeout);
       if (!room) return;
+      const meta = room.sockets.get(socket);
+      room.sockets.delete(socket);
       room.members.delete(socket);
       if (!room.members.size) room.emptySince = now();
-      broadcast(room, { type: 'presence', participants: room.members.size });
+      broadcast(room, { type: 'presence', participants: room.members.size, roster: roster(room) });
+      if (meta) sendHosts(room, { type: 'participantGone', participantId: meta.participantId });
       if (room.readyMembers.delete(socket) && room.state.file) broadcast(room, readiness(room));
     });
   });
